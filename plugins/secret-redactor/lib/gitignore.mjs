@@ -4,8 +4,10 @@
 // GradeThread tracks .env.production and .env.example, so a name-only rule would
 // let a real key reach GitHub in the one place nobody would look for it.
 import { spawnSync } from "node:child_process";
+import path from "node:path";
 
 const ENV_NAME = /(^|[/\\])\.env(\.|$)/;
+const GIT_TIMEOUT_MS = 5000;
 
 // exit 0 = ignored, exit 1 = not ignored, anything else = git could not answer.
 //
@@ -15,9 +17,28 @@ const ENV_NAME = /(^|[/\\])\.env(\.|$)/;
 // in .gitignore). Git's default behaviour already encodes what this guard
 // needs: a tracked path is never "ignored", so it falls through to be
 // scanned like anything else.
+//
+// The child process's cwd follows the FILE, not the caller's cwd. A session
+// working in one repo can still Write into a path that lives in a different
+// repo (ten projects share this machine, and cross-repo writes are
+// routine). Asking git from the session's cwd about a path outside it fails
+// with "outside repository at ..." -> available:false -> the name-based
+// fallback used to exempt a tracked .env.production in the OTHER repo,
+// silently allowing the exact write this guard exists to stop. Resolving
+// from the file's own directory lets git walk up to the repo that actually
+// owns the path.
+//
+// `timeout` matters for the same reason `result.status === null` was already
+// handled below: a git that blocks (index.lock contention, a stalled
+// network filesystem, a slow AV scan) would otherwise burn the hook's whole
+// PreToolUse budget, get killed by the harness, and a killed hook does not
+// deny. Timing the child out ourselves turns that into a fast, honest
+// "git could not answer" instead.
 export function gitIgnores(filePath, cwd) {
+  const dir = path.isAbsolute(filePath) ? path.dirname(filePath) : cwd;
   const result = spawnSync("git", ["check-ignore", "--quiet", "--", filePath], {
-    cwd,
+    cwd: dir,
+    timeout: GIT_TIMEOUT_MS,
     stdio: "ignore",
   });
   if (result.error || result.status === null) return { available: false, ignored: false };
@@ -26,7 +47,12 @@ export function gitIgnores(filePath, cwd) {
   return { available: false, ignored: false };
 }
 
-export function envExemption(filePath, cwd = process.cwd()) {
+// `rawFilePath` may not be a string at all (a malformed tool_input can hand
+// us anything). Coerce to "" rather than letting .replaceAll() throw -
+// an empty path is not .env-shaped and gitIgnores("") reports unavailable,
+// so it lands on the deny side, same as any other unrecognized path.
+export function envExemption(rawFilePath, cwd = process.cwd()) {
+  const filePath = typeof rawFilePath === "string" ? rawFilePath : "";
   const looksLikeEnv = ENV_NAME.test(filePath.replaceAll("\\", "/"));
   const { available, ignored } = gitIgnores(filePath, cwd);
 
@@ -37,7 +63,7 @@ export function envExemption(filePath, cwd = process.cwd()) {
     return { exempt: false, reason: "git tracks this path" };
   }
   if (looksLikeEnv) {
-    return { exempt: true, reason: "not a git repo, falling back to the .env name rule" };
+    return { exempt: true, reason: "git could not answer for this path, falling back to the .env name rule" };
   }
-  return { exempt: false, reason: "not a git repo, and this is not a .env file" };
+  return { exempt: false, reason: "git could not answer for this path, and this is not a .env file" };
 }

@@ -4,14 +4,47 @@
 // document at all, before git is ever involved.
 import path from "node:path";
 import { readStdinJson, writeResult, MAX_BYTES } from "./io.mjs";
-import { findSecrets } from "../lib/detect.mjs";
+import { findSecrets, redactText } from "../lib/detect.mjs";
 import { envExemption } from "../lib/gitignore.mjs";
 
-const input = await readStdinJson(MAX_BYTES);
+// Oversized input is a special case for THIS hook only: a throw or malformed
+// stdin still fails open (the hook is broken; don't brick the session), but
+// oversized input means the hook is working fine and is being asked to
+// certify content it never got to examine. Refusing is the honest answer -
+// it costs a rare oversized write with an obvious workaround (split it),
+// while silently allowing it risks an unexamined credential. The two
+// redactor hooks keep failing open on oversize; there the alternative is
+// corrupting output, which is worse.
+let oversizeBytes = null;
+const input = await readStdinJson(MAX_BYTES, {
+  onOversize: (size) => {
+    oversizeBytes = size;
+  },
+});
+
+if (oversizeBytes !== null) {
+  writeResult({
+    systemMessage: `secret-redactor: refused a write too large to scan for credentials (${oversizeBytes} bytes)`,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason:
+        `secret-gate: this write is ${oversizeBytes} bytes, over the ${MAX_BYTES}-byte scan limit, ` +
+        `so it cannot be checked for credentials. Split it into smaller writes.`,
+    },
+  });
+  process.exit(0);
+}
+
 if (!input || input.hook_event_name !== "PreToolUse") process.exit(0);
 
 const toolInput = input.tool_input ?? {};
-const filePath = toolInput.file_path ?? toolInput.notebook_path ?? "";
+// file_path/notebook_path may not be a string at all if tool_input is
+// malformed; coerce so downstream .replaceAll()/path.basename() calls can't
+// throw and turn a would-be deny into a silent allow via an uncaught
+// rejection (io.mjs's handler exits 0 on those).
+const rawFilePath = toolInput.file_path ?? toolInput.notebook_path ?? "";
+const filePath = typeof rawFilePath === "string" ? rawFilePath : "";
 const content = toolInput.content ?? toolInput.new_string ?? toolInput.new_source ?? "";
 if (typeof content !== "string" || content.length === 0) process.exit(0);
 
@@ -23,7 +56,10 @@ if (exempt) process.exit(0);
 
 const shown = hits.slice(0, 3).map((h) => `${h.label} at line ${h.line}`).join(", ");
 const more = hits.length > 3 ? `, and ${hits.length - 3} more` : "";
-const name = filePath ? path.basename(filePath) : "this file";
+// The basename itself can be credential-shaped (a pasted key used as a
+// filename). "Never print a secret value" has no exceptions, so redact it
+// same as any other text before it goes into the deny message.
+const name = filePath ? redactText(path.basename(filePath)) : "this file";
 
 writeResult({
   systemMessage: `secret-redactor: blocked a write of ${hits.length} credential(s) into ${name}`,
