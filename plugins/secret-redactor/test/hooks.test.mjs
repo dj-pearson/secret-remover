@@ -9,6 +9,7 @@ import { runHook } from "./helpers/run-hook.mjs";
 import { makeRepo, runGit } from "./helpers/temp-repo.mjs";
 import { gitIgnores } from "../lib/gitignore.mjs";
 import { MAX_BYTES } from "../hooks/io.mjs";
+import { ALLOWLIST_FILE } from "../lib/allowlist.mjs";
 
 const PLUGIN = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const TOKEN = "ghp_" + "f".repeat(36);
@@ -596,3 +597,165 @@ test("PreToolUse: a not-yet-existing folder does not disable the git answer (Fin
   assert.equal(case4, "", "case 4 (gitignored .env in a new folder) must stay silent");
 });
 
+
+// --- Task 8: wire the allowlist into the write guard -----------------------
+
+// The brief's own prose required the guard to consult .secretgate.json; the
+// code that shipped never read one. These four cases pin the fix: an
+// allowlisted path allows, a non-allowlisted path in the same repo still
+// denies, no file behaves as before, and a broken file denies rather than
+// allowing.
+
+test("PreToolUse: an allowlisted path allows a write that would otherwise deny", async () => {
+  const cwd = makeRepo({
+    [ALLOWLIST_FILE]: JSON.stringify({ version: 1, paths: ["^test/fixtures/"] }),
+    "test/fixtures/.gitkeep": "",
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "test", "fixtures", "corpus.txt"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, "", "an allowlisted path must allow silently, just like a clean write");
+});
+
+test("PreToolUse: a non-allowlisted path in the same repo still denies", async () => {
+  const cwd = makeRepo({
+    [ALLOWLIST_FILE]: JSON.stringify({ version: 1, paths: ["^test/fixtures/"] }),
+    "src/.gitkeep": "",
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "src", "app.ts"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  const out = JSON.parse(stdout);
+  assert.equal(
+    out.hookSpecificOutput.permissionDecision,
+    "deny",
+    "the allowlist must not exempt a path it does not cover",
+  );
+});
+
+test("PreToolUse: a repo with no .secretgate.json behaves exactly as before", async () => {
+  const cwd = makeRepo({ "docs/.gitkeep": "" });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "docs", "setup.md"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("PreToolUse: a malformed .secretgate.json denies rather than allowing", async () => {
+  const cwd = makeRepo({
+    [ALLOWLIST_FILE]: "{ not json",
+    "test/fixtures/.gitkeep": "",
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      // This path WOULD have been allowlisted by a well-formed file with the
+      // same paths rule - proving the broken file fails closed rather than
+      // simply skipping allowlist logic and denying for the ordinary reason.
+      tool_input: { file_path: path.join(cwd, "test", "fixtures", "corpus.txt"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  const out = JSON.parse(stdout);
+  assert.equal(
+    out.hookSpecificOutput.permissionDecision,
+    "deny",
+    "a broken .secretgate.json is not permission to write a credential",
+  );
+  // Tighter than "mentions .secretgate.json somewhere" - the ordinary deny
+  // message already says that much as generic advice ("add it to
+  // .secretgate.json first"), which would make this assertion pass even if
+  // the allowlist were never consulted at all. Pin the file-is-the-problem
+  // wording specifically so a missing wiring shows up as a failure here.
+  assert.match(
+    out.hookSpecificOutput.permissionDecisionReason,
+    /\.secretgate\.json (?:is unreadable|could not be read)/,
+    "the deny reason should name the allowlist file itself as unreadable, not just mention it as advice",
+  );
+});
+
+// --- Task 8: harden every git call against inherited GIT_* env vars --------
+
+// Git sets GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE for every hook it runs, and
+// this code is meant to be vendored into a pre-commit hook by later tasks -
+// so an inherited GIT_DIR pointing at some other repository is the normal
+// case there, not an edge case. Without stripping those vars before calling
+// git, they override `cwd` entirely: git answers about the WRONG repo, the
+// path looks "outside the repository", envExemption's git-unavailable
+// fallback kicks in, and a tracked .env.production is allowed through by
+// name alone.
+test("PreToolUse: inherited GIT_DIR/GIT_WORK_TREE must not hijack which repo git answers about (Requirement 2)", async () => {
+  const targetRepo = makeRepo({
+    ".gitignore": ".env.*\n",
+    ".env.production": "VITE_PUBLIC=1\n",
+  });
+  assert.ok(
+    isIgnoredByGit(targetRepo, ".env.production"),
+    "fixture premise broken: .gitignore does not match .env.production before it is force-tracked",
+  );
+  runGit(targetRepo, "add", "-f", ".env.production");
+  runGit(targetRepo, "commit", "-qm", "track env.production");
+
+  // A wholly unrelated repo, injected via the environment the way git itself
+  // injects it into every hook it invokes.
+  const poisonRepo = makeRepo({});
+
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(targetRepo, ".env.production"), content: "STRIPE_KEY=" + LIVE },
+    },
+    {
+      cwd: targetRepo,
+      env: {
+        ...process.env,
+        GIT_DIR: path.join(poisonRepo, ".git"),
+        GIT_WORK_TREE: poisonRepo,
+        GIT_INDEX_FILE: path.join(poisonRepo, ".git", "index"),
+      },
+    },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  assert.notEqual(
+    stdout,
+    "",
+    "the write was allowed silently - inherited GIT_DIR/GIT_WORK_TREE hijacked which repo git answered about",
+  );
+  const out = JSON.parse(stdout);
+  assert.equal(
+    out.hookSpecificOutput.permissionDecision,
+    "deny",
+    "inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE must not flip a tracked .env.production to an allow",
+  );
+});

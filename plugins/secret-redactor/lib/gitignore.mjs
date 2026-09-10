@@ -10,6 +10,25 @@ import path from "node:path";
 const ENV_NAME = /(^|[/\\])\.env(\.|$)/;
 const GIT_TIMEOUT_MS = 5000;
 
+// Git sets GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE for every hook it runs,
+// and Tasks 9-11 vendor this code into repos where it runs FROM a pre-commit
+// hook - so a process environment that already carries those vars is the
+// normal case there, not an edge case. Left alone they override `cwd`
+// entirely: git answers about whatever repo GIT_DIR names, not the one this
+// module resolved and passed as `cwd`. Measured consequence: a secret
+// written into another repo's tracked .env.production reads as "outside the
+// repository" under the poisoned GIT_DIR, envExemption's git-unavailable
+// fallback exempts it by name alone, and a DENY silently becomes an ALLOW.
+// Stripping them before every spawnSync call is the fix; process.env itself
+// is never mutated, only the copy handed to the child.
+function gitEnv() {
+  const env = { ...process.env };
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_INDEX_FILE;
+  return env;
+}
+
 // Write routinely creates a brand new folder, and Claude Code always sends an
 // absolute file_path - so `path.dirname(filePath)` frequently names a
 // directory that does not exist YET. Handing that straight to spawnSync's
@@ -60,11 +79,34 @@ export function gitIgnores(filePath, cwd) {
     cwd: dir,
     timeout: GIT_TIMEOUT_MS,
     stdio: "ignore",
+    env: gitEnv(),
   });
   if (result.error || result.status === null) return { available: false, ignored: false };
   if (result.status === 0) return { available: true, ignored: true };
   if (result.status === 1) return { available: true, ignored: false };
   return { available: false, ignored: false };
+}
+
+// Resolves the repo root that owns `filePath`, for callers (the write guard,
+// loading .secretgate.json) that need to ask git something beyond
+// check-ignore. Reuses the same cwd-resolution as gitIgnores above rather
+// than inventing a second way to find the right directory to ask git about:
+// climb to the nearest existing ancestor first, since Write routinely
+// targets a not-yet-created folder, then ask git from there. Returns null
+// (not a throw) when git can't answer - no repo, a timeout, git missing -
+// so a caller can fall back to "no allowlist" the same way envExemption
+// falls back to the .env name rule.
+export function repoRootFor(filePath, cwd) {
+  const dir = path.isAbsolute(filePath) ? nearestExistingAncestor(path.dirname(filePath)) : cwd;
+  const result = spawnSync("git", ["rev-parse", "--show-toplevel"], {
+    cwd: dir,
+    timeout: GIT_TIMEOUT_MS,
+    encoding: "utf8",
+    env: gitEnv(),
+  });
+  if (result.error || result.status !== 0 || typeof result.stdout !== "string") return null;
+  const root = result.stdout.trim();
+  return root.length > 0 ? root : null;
 }
 
 // `rawFilePath` may not be a string at all (a malformed tool_input can hand

@@ -5,7 +5,8 @@
 import path from "node:path";
 import { readStdinJson, writeResult, MAX_BYTES } from "./io.mjs";
 import { findSecrets, redactText } from "../lib/detect.mjs";
-import { envExemption } from "../lib/gitignore.mjs";
+import { envExemption, repoRootFor } from "../lib/gitignore.mjs";
+import { loadAllowlist, isAllowed, ALLOWLIST_FILE } from "../lib/allowlist.mjs";
 
 // Oversized input is a special case for THIS hook only: a throw or malformed
 // stdin still fails open (the hook is broken; don't brick the session), but
@@ -58,25 +59,67 @@ if (oversizeBytes !== null) {
       const { exempt, reason } = envExemption(filePath, process.cwd());
 
       if (!exempt) {
-        const shown = hits.slice(0, 3).map((h) => `${h.label} at line ${h.line}`).join(", ");
-        const more = hits.length > 3 ? `, and ${hits.length - 3} more` : "";
-        // The basename itself can be credential-shaped (a pasted key used as
-        // a filename). "Never print a secret value" has no exceptions, so
-        // redact it same as any other text before it goes into the deny
-        // message.
-        const name = filePath ? redactText(path.basename(filePath)) : "this file";
+        // Resolve the repo that owns this file the same way envExemption
+        // does (climb to the nearest existing ancestor first - Write
+        // routinely targets a not-yet-created folder), then see whether it
+        // allowlists any of what findSecrets found. No repo, or no
+        // .secretgate.json in it, behaves exactly as before: every hit
+        // survives.
+        const repoRoot = filePath ? repoRootFor(filePath, process.cwd()) : null;
 
-        writeResult({
-          systemMessage: `secret-redactor: blocked a write of ${hits.length} credential(s) into ${name}`,
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "deny",
-            permissionDecisionReason:
-              `secret-gate: this would write ${shown}${more} into ${name} (${reason}). ` +
-              `Put the value in a gitignored .env file and reference it by name instead. ` +
-              `If it is a fixture, add it to .secretgate.json first.`,
-          },
-        });
+        let allowlist = null;
+        let allowlistError = null;
+        if (repoRoot) {
+          try {
+            allowlist = loadAllowlist(repoRoot);
+          } catch (err) {
+            allowlistError = err;
+          }
+        }
+
+        if (allowlistError) {
+          // A malformed or invalid-regex .secretgate.json must NOT fail
+          // open just because it means the harness couldn't decide what's
+          // allowlisted - a broken allowlist is not permission to write a
+          // credential. loadAllowlist's own error message never contains
+          // file content (it's a JSON-parse or regex-compile error, not the
+          // .secretgate.json body), so it's safe to surface as-is.
+          writeResult({
+            systemMessage: `secret-redactor: blocked a write because ${ALLOWLIST_FILE} could not be read`,
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse",
+              permissionDecision: "deny",
+              permissionDecisionReason:
+                `secret-gate: ${ALLOWLIST_FILE} is unreadable (${allowlistError.message}). ` +
+                `Fix or remove it before writing credential-shaped content.`,
+            },
+          });
+        } else {
+          const relPath = allowlist && repoRoot ? path.relative(repoRoot, path.resolve(filePath)).replaceAll("\\", "/") : null;
+          const survivingHits = allowlist ? hits.filter((hit) => !isAllowed(allowlist, relPath, hit)) : hits;
+
+          if (survivingHits.length > 0) {
+            const shown = survivingHits.slice(0, 3).map((h) => `${h.label} at line ${h.line}`).join(", ");
+            const more = survivingHits.length > 3 ? `, and ${survivingHits.length - 3} more` : "";
+            // The basename itself can be credential-shaped (a pasted key used as
+            // a filename). "Never print a secret value" has no exceptions, so
+            // redact it same as any other text before it goes into the deny
+            // message.
+            const name = filePath ? redactText(path.basename(filePath)) : "this file";
+
+            writeResult({
+              systemMessage: `secret-redactor: blocked a write of ${survivingHits.length} credential(s) into ${name}`,
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "deny",
+                permissionDecisionReason:
+                  `secret-gate: this would write ${shown}${more} into ${name} (${reason}). ` +
+                  `Put the value in a gitignored .env file and reference it by name instead. ` +
+                  `If it is a fixture, add it to ${ALLOWLIST_FILE} first.`,
+              },
+            });
+          }
+        }
       }
     }
   }
