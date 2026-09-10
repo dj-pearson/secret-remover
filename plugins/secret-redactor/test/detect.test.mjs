@@ -66,3 +66,62 @@ test("DETECTOR_LABELS is frozen and covers every label findSecrets can emit", ()
   assert.ok(DETECTOR_LABELS.includes("url-password"));
   assert.ok(DETECTOR_LABELS.includes("bearer-token"));
 });
+
+import { redactText, redactDeep, newState } from "../lib/detect.mjs";
+
+test("redactText replaces the value and leaves the label in place", () => {
+  const token = "ghp_" + "c".repeat(36);
+  const out = redactText("GITHUB_TOKEN=" + token);
+  assert.equal(out, "GITHUB_TOKEN=[REDACTED github-token #1]");
+  assert.ok(!out.includes(token));
+});
+
+test("the same value gets the same number twice", () => {
+  const token = "ghp_" + "d".repeat(36);
+  const out = redactText(token + " and again " + token);
+  assert.equal(out, "[REDACTED github-token #1] and again [REDACTED github-token #1]");
+});
+
+test("redaction is idempotent", () => {
+  const once = redactText("aws=[REDACTED aws-access-key-id #1]");
+  const twice = redactText(once);
+  assert.equal(twice, once);
+});
+
+test("redactText returns the input unchanged when nothing is found", () => {
+  const clean = "246 tests, 246 passing";
+  assert.equal(redactText(clean), clean);
+});
+
+test("redactDeep walks objects and arrays and keeps the shape", () => {
+  const input = {
+    stdout: "token=ghp_" + "e".repeat(36),
+    stderr: "",
+    interrupted: false,
+    codes: [0, 1],
+    nested: { deeper: ["AKIAZZZZZZZZZZZZZZZZ"] },
+  };
+  const { value, total, hits } = redactDeep(input);
+  assert.equal(total, 2);
+  assert.equal(value.interrupted, false);
+  assert.deepEqual(value.codes, [0, 1]);
+  assert.equal(value.stderr, "");
+  assert.ok(value.nested.deeper[0].startsWith("[REDACTED aws-access-key-id"));
+  assert.deepEqual(new Set(hits.map((h) => h.label)), new Set(["github-token", "aws-access-key-id"]));
+});
+
+test("redactDeep returns the original object when there is nothing to redact", () => {
+  const input = { stdout: "all good", exitCode: 0 };
+  const { value, total } = redactDeep(input);
+  assert.equal(total, 0);
+  assert.equal(value, input, "must be the same reference, not a copy");
+});
+
+test("a shared state numbers values consistently across calls", () => {
+  const state = newState();
+  const a = redactText("AKIAZZZZZZZZZZZZZZZZ", state);
+  const b = redactText("see AKIAZZZZZZZZZZZZZZZZ again", state);
+  assert.ok(a.includes("#1"));
+  assert.ok(b.includes("#1"));
+  assert.equal(state.hits.length, 1);
+});

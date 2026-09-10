@@ -191,3 +191,55 @@ export function findSecrets(text) {
   }
   return out;
 }
+
+// --- redaction -------------------------------------------------------------
+
+export function newState() {
+  return { n: 0, seen: new Map(), hits: [] };
+}
+
+export function tokenFor(value, label, state) {
+  const existing = state.seen.get(value);
+  if (existing) return existing;
+  const id = ++state.n;
+  const token = `[REDACTED ${label} #${id}]`;
+  state.seen.set(value, token);
+  state.hits.push({ label, id });
+  return token;
+}
+
+export function redactText(text, state = newState()) {
+  const hits = findSecrets(text);
+  if (hits.length === 0) return text;
+  let out = "";
+  let last = 0;
+  for (const hit of hits) {
+    out += text.slice(last, hit.start) + tokenFor(hit.value, hit.label, state);
+    last = hit.end;
+  }
+  return out + text.slice(last);
+}
+
+// Returns the ORIGINAL value when nothing was found. Callers rely on this: a
+// hook that emits an identity rewrite races last-write-wins against a sibling
+// hook doing a real redaction.
+export function redactDeep(value, state = newState()) {
+  const walk = (node) => {
+    if (typeof node === "string") return redactText(node, state);
+    if (Array.isArray(node)) return node.map(walk);
+    if (node && typeof node === "object") {
+      const copy = {};
+      for (const key of Object.keys(node)) copy[key] = walk(node[key]);
+      return copy;
+    }
+    return node;
+  };
+  const redacted = walk(value);
+  return { value: state.hits.length ? redacted : value, total: state.hits.length, hits: state.hits };
+}
+
+export function summarize(hits) {
+  const counts = new Map();
+  for (const { label } of hits) counts.set(label, (counts.get(label) ?? 0) + 1);
+  return [...counts].map(([label, n]) => `${n} ${label}`).join(", ");
+}
