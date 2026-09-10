@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { runHook } from "./helpers/run-hook.mjs";
+import { makeRepo, runGit } from "./helpers/temp-repo.mjs";
 
 const PLUGIN = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const TOKEN = "ghp_" + "f".repeat(36);
@@ -118,5 +121,179 @@ test("hooks.json registers all three hooks against the right events", () => {
   }
 });
 
+// --- Task 7: the PreToolUse write guard ------------------------------------
 
+const LIVE = "sk_live_" + "b".repeat(20);
+
+test("PreToolUse: denies writing a secret into a tracked file", async () => {
+  const cwd = makeRepo({
+    ".gitignore": ".env\n.env.local\n",
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "docs", "setup.md"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(out.hookSpecificOutput.permissionDecisionReason, /stripe-key/);
+  assert.match(out.hookSpecificOutput.permissionDecisionReason, /setup\.md/);
+});
+
+test("PreToolUse: allows writing a secret into a gitignored .env", async () => {
+  const cwd = makeRepo({
+    ".gitignore": ".env\n.env.local\n",
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, ".env.local"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, "");
+});
+
+// Regression test for the --no-index bug described in the task brief.
+//
+// `git check-ignore --quiet --no-index -- <path>` answers from the ignore
+// patterns alone, so it reports a TRACKED .env.production as "ignored" even
+// though git is already carrying it. That flips the exemption backwards and
+// lets a real key sail through into the one file nobody double-checks.
+// Without --no-index, git's default behaviour already does the right thing:
+// a tracked path is never "ignored", so it gets scanned like anything else.
+//
+// This repo's .gitignore covers .env.* (which would normally catch
+// .env.production too), but the file is force-added and committed, so it is
+// tracked. The guard MUST deny here. With --no-index this test fails; without
+// it, it passes.
+test("PreToolUse: denies a secret in a TRACKED .env.production (regression: --no-index inverts this)", async () => {
+  const cwd = makeRepo({
+    ".gitignore": ".env.*\n",
+    ".env.production": "VITE_PUBLIC=1\n",
+  });
+  // makeRepo's own `git add -A` skipped .env.production because .gitignore
+  // covers it. Force-add it and commit so it is genuinely tracked.
+  runGit(cwd, "add", "-f", ".env.production");
+  runGit(cwd, "commit", "-qm", "track env.production");
+
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, ".env.production"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  const out = JSON.parse(stdout);
+  assert.equal(
+    out.hookSpecificOutput.permissionDecision,
+    "deny",
+    "a tracked .env.production must be scanned like any other tracked file",
+  );
+});
+
+test("PreToolUse: reads Edit new_string and NotebookEdit new_source", async () => {
+  const cwd = makeRepo({
+    ".gitignore": ".env\n.env.local\n",
+  });
+  for (const [tool, key] of [
+    ["Edit", "new_string"],
+    ["NotebookEdit", "new_source"],
+  ]) {
+    const { stdout } = await runHook(
+      "guard-write.mjs",
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: tool,
+        tool_input: { file_path: path.join(cwd, "notes.md"), [key]: "STRIPE_KEY=" + LIVE },
+      },
+      { cwd },
+    );
+    const out = JSON.parse(stdout);
+    assert.equal(out.hookSpecificOutput.permissionDecision, "deny", tool + " was not blocked");
+  }
+});
+
+test("PreToolUse: stays silent for clean content", async () => {
+  const cwd = makeRepo({
+    ".gitignore": ".env\n.env.local\n",
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "notes.md"), content: "# Notes\n\nnothing here\n" },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, "");
+});
+
+test("PreToolUse: outside a git repo, falls back to the .env name rule and says so", async () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), "secret-gate-nogit-"));
+  const { stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "notes.md"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(out.hookSpecificOutput.permissionDecisionReason, /not a git repo/i);
+});
+
+test("PreToolUse: outside a git repo, an actual .env file is exempt by name and stays silent", async () => {
+  const cwd = mkdtempSync(path.join(tmpdir(), "secret-gate-nogit-"));
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, ".env.local"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, "");
+});
+
+test("PreToolUse: ignores an event that is not its own", async () => {
+  const cwd = makeRepo({});
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PostToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "notes.md"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.equal(stdout, "");
+});
+
+test("PreToolUse: fails open on malformed stdin", async () => {
+  const cwd = makeRepo({});
+  const { code, stdout } = await runHook("guard-write.mjs", "}}}not json", { cwd });
+  assert.equal(code, 0);
+  assert.equal(stdout, "");
+});
 
