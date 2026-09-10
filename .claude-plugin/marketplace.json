@@ -1,0 +1,21 @@
+{
+  "name": "pearson-media",
+  "owner": {
+    "name": "Pearson Media LLC",
+    "url": "https://github.com/dj-pearson"
+  },
+  "metadata": {
+    "description": "Claude Code plugins used across the Pearson Media portfolio",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "secret-redactor",
+      "source": "./plugins/secret-redactor",
+      "version": "2.0.0",
+      "description": "Keeps plaintext credentials out of transcripts, out of files, and out of GitHub.",
+      "category": "security",
+      "keywords": ["security", "secrets", "redaction", "hooks", "pre-commit"]
+    }
+  ]
+}

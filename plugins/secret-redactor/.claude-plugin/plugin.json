@@ -1,0 +1,9 @@
+{
+  "name": "secret-redactor",
+  "version": "2.0.0",
+  "description": "Keeps plaintext credentials out of transcripts, out of files, and out of GitHub.",
+  "author": {
+    "name": "Pearson Media LLC"
+  },
+  "keywords": ["security", "secrets", "redaction", "hooks", "pre-commit"]
+}
