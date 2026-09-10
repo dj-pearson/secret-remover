@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, mkdtempSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { writeFileSync, mkdtempSync, existsSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { makeRepo, runCli } from "./helpers/temp-repo.mjs";
@@ -267,4 +267,101 @@ test("makeRepo works even when the outer process has GIT_DIR set (e.g. running u
     if (saved === undefined) delete process.env.GIT_DIR;
     else process.env.GIT_DIR = saved;
   }
+});
+
+// --- Task 10 review corrections ---------------------------------------------
+
+// Correction 1a: a directory explicit argument used to sail through
+// existsSync (true for a directory) and fail later inside readFileSync as an
+// unlabeled EISDIR skip - which reports plain exit 0. `scan .` in someone's
+// CI would then be a permanently green gate that scanned nothing. A
+// directory argument must be rejected outright (exit 2) rather than
+// expanded or silently skipped - see cli.mjs for the "why reject rather
+// than expand" note.
+test("scan with a directory argument exits 2, not 0 (a bare 'docs' path)", () => {
+  const dir = makeRepo({ "docs/setup.md": "STRIPE_KEY=" + LIVE + "\n" }, { commit: true });
+  const { code, stderr } = runCli(dir, ["scan", "docs"]);
+  assert.equal(code, 2, "a directory argument must never read back as a clean scan");
+  assert.match(stderr, /docs/);
+});
+
+test("scan with a trailing-slash directory argument exits 2, not 0 ('docs/')", () => {
+  const dir = makeRepo({ "docs/setup.md": "STRIPE_KEY=" + LIVE + "\n" }, { commit: true });
+  const { code, stderr } = runCli(dir, ["scan", "docs/"]);
+  assert.equal(code, 2);
+  assert.match(stderr, /docs/);
+});
+
+test("scan '.' exits 2, not a silently-clean 0", () => {
+  const dir = makeRepo({ "docs/setup.md": "STRIPE_KEY=" + LIVE + "\n" }, { commit: true });
+  const { code, stderr } = runCli(dir, ["scan", "."]);
+  assert.equal(code, 2, "'scan .' must not become a permanently green gate that scanned nothing");
+  assert.match(stderr, /\./);
+});
+
+// Correction 1b: path.win32.relative("C:/repo", "D:/secrets/keys.env") returns
+// the absolute path unchanged (no leading ".."), so the existing
+// dotdot-only outside-the-repo guard let a cross-drive path through, where
+// it degraded to an ENOENT skip and a plain exit 0. Reproduced with `subst`
+// (no admin rights required) rather than assuming a second physical drive
+// exists on the machine running this suite.
+test(
+  "an absolute path on a different drive letter is rejected as outside the repo, not silently skipped",
+  { skip: process.platform !== "win32" ? "cross-drive paths are a Windows-only concept" : false },
+  () => {
+    const letter = ["Z", "Y", "X", "W", "V", "U"].find((l) => !existsSync(`${l}:\\`));
+    assert.ok(letter, "no free drive letter available to subst for this test");
+
+    const target = mkdtempSync(path.join(tmpdir(), "cross-drive-"));
+    writeFileSync(path.join(target, "keys.env"), "STRIPE_KEY=" + LIVE + "\n");
+
+    const substResult = spawnSync("subst", [`${letter}:`, target]);
+    assert.equal(substResult.status, 0, "subst failed to create the virtual drive - cannot exercise this guard");
+
+    try {
+      const dir = makeRepo({ "a.md": "clean\n" }, { commit: true });
+      const { code, stderr } = runCli(dir, ["scan", `${letter}:\\keys.env`]);
+      assert.equal(code, 2, "a cross-drive path must be rejected, not degrade into an ENOENT skip (exit 0)");
+      assert.match(stderr, /outside the repository/i);
+    } finally {
+      spawnSync("subst", [`${letter}:`, "/D"]);
+      rmSync(target, { recursive: true, force: true });
+    }
+  },
+);
+
+// Correction 2: --diff-filter=ACMR (later ACMRT) is an allowlist of status
+// letters closed by NAME rather than by CLASS - the same mistake this
+// plugin has now made three times (T had to be added after a symlink-swap
+// slipped through). --diff-filter=d (lowercase - exclude deletions) is
+// deny-by-default: it survives any status letter git adds later. This
+// fixture stages a type-change (T), a deletion (D) and a plain add (A)
+// together and checks all three are handled correctly in one pass.
+test("--diff-filter=d scans an added file and a type-change but excludes a deletion, all staged together", () => {
+  // gone.md's content is deliberately unrelated to new.md's - identical
+  // content would let git's rename detection report this pair as R100
+  // instead of a plain D + A, which would not exercise the deletion branch
+  // at all.
+  const dir = makeRepo({ "keep.md": "clean\n", "gone.md": "nothing secret about this file at all\n" }, { commit: true });
+
+  const symlinkBlob = gitPlumbing(dir, ["hash-object", "-w", "--stdin"], "somewhere");
+  execFileSync("git", ["update-index", "--add", "--cacheinfo", `120000,${symlinkBlob},cfg`], { cwd: dir });
+  execFileSync("git", ["commit", "-qm", "cfg as symlink"], { cwd: dir });
+
+  const secretBlob = gitPlumbing(dir, ["hash-object", "-w", "--stdin"], "STRIPE_KEY=" + LIVE + "\n");
+  execFileSync("git", ["update-index", "--cacheinfo", `100644,${secretBlob},cfg`], { cwd: dir });
+  execFileSync("git", ["rm", "--cached", "-q", "gone.md"], { cwd: dir });
+  writeFileSync(path.join(dir, "new.md"), "STRIPE_KEY=" + LIVE + "\n");
+  execFileSync("git", ["add", "new.md"], { cwd: dir });
+
+  const status = gitPlumbing(dir, ["diff", "--cached", "--name-status"]);
+  assert.match(status, /^T\s+cfg/m, "fixture did not produce a type-change (T)");
+  assert.match(status, /^D\s+gone\.md/m, "fixture did not produce a deletion (D)");
+  assert.match(status, /^A\s+new\.md/m, "fixture did not produce an add (A)");
+
+  const { code, stdout } = runCli(dir, ["scan", "--staged"]);
+  assert.equal(code, 1, "the type-change and the new file must both be scanned");
+  assert.match(stdout, /cfg/);
+  assert.match(stdout, /new\.md/);
+  assert.ok(!stdout.includes("gone.md"), "a deleted path has nothing staged to scan and must not be reported");
 });

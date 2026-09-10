@@ -14,11 +14,11 @@
 // as a warning and lets the commit through, because a crashing scanner must not
 // brick committing in twenty repos. CI treats 2 as a failure, because there the
 // right response to a broken scanner is a red build.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { findSecrets, MAX_SCAN_BYTES } from "./detect.mjs";
+import { findSecrets, newState, tokenFor, MAX_SCAN_BYTES } from "./detect.mjs";
 import { loadAllowlist, isAllowed, staleEntries, ALLOWLIST_FILE } from "./allowlist.mjs";
 import { gitEnv } from "./gitignore.mjs";
 
@@ -55,11 +55,14 @@ export function repoRoot(cwd = process.cwd()) {
 }
 
 function stagedPaths(root) {
-  // ACMR alone drops type changes (T) - e.g. a tracked symlink replaced in
-  // the index by a regular file holding a credential, an ordinary move on
-  // POSIX. Adding T is enough: D (deletions) still has nothing to scan, and
-  // every remaining status names a path with real staged content.
-  const result = git(["diff", "--cached", "--name-only", "--diff-filter=ACMRT", "-z"], root);
+  // An explicit allowlist of status letters (first ACMR, then ACMRT once a
+  // symlink-replaced-by-a-regular-file slipped through as a type change) is
+  // closed by NAME, not by CLASS - the same mistake fixed twice already.
+  // --diff-filter=d (lowercase: EXCLUDE deletions) is deny-by-default - it
+  // keeps every status letter git has today or adds tomorrow except the one
+  // that never has content to scan, so a future status letter can't repeat
+  // this hole a fourth time.
+  const result = git(["diff", "--cached", "--name-only", "--diff-filter=d", "-z"], root);
   if (result.status !== 0) throw new Error("could not list staged files");
   return result.stdout.split(String.fromCharCode(0)).filter(Boolean);
 }
@@ -77,13 +80,40 @@ function trackedPaths(root) {
 // root-relative path. Throws - rather than quietly producing nothing to scan
 // - on a path that doesn't exist or that resolves outside the repository: a
 // typo in an explicit path argument must never read back as "repo is clean."
+//
+// A directory argument is REJECTED rather than expanded to the tracked files
+// beneath it. `scan` already has two well-defined ways to mean "more than
+// one file" - no path arguments (every tracked file) and --staged (every
+// staged file) - and silently reinterpreting "scan docs" as "scan every
+// tracked file under docs" would add a third set of semantics that
+// interacts with gitignored files, untracked files and the staged filter in
+// ways a caller can't see from the command line. Before this fix,
+// `existsSync(abs)` was true for a directory, `readFileSync` inside
+// readTarget() then failed with an unlabeled EISDIR, and that came back as
+// an ordinary skip - exit 0 by default. `scan .` in someone's CI was a
+// permanently green gate that scanned nothing.
 function resolveExplicitPaths(root, cwd, args) {
   return args.map((arg) => {
     const abs = path.resolve(cwd, arg);
     if (!existsSync(abs)) {
       throw new Error(`${arg}: no such file`);
     }
-    const rel = path.relative(root, abs).replaceAll("\\", "/");
+    if (statSync(abs).isDirectory()) {
+      throw new Error(`${arg}: is a directory - pass individual file paths, or omit paths to scan every tracked file`);
+    }
+    // path.relative computed BEFORE the "\\" -> "/" normalization, and
+    // checked for path.isAbsolute, not just a leading "..": on Windows,
+    // path.relative("C:\\repo", "D:\\secrets\\keys.env") returns the second
+    // path unchanged (absolute, no leading ".."), because there is no
+    // relative path between two drives. The dotdot-only check let that
+    // through, and it degraded further downstream into a plain ENOENT skip
+    // (path.join glues an absolute Windows path onto the repo root, which
+    // resolves nowhere) - exit 0 instead of exit 2.
+    const relRaw = path.relative(root, abs);
+    if (path.isAbsolute(relRaw)) {
+      throw new Error(`${arg}: outside the repository`);
+    }
+    const rel = relRaw.replaceAll("\\", "/");
     if (rel === ".." || rel.startsWith("../")) {
       throw new Error(`${arg}: outside the repository`);
     }
@@ -217,6 +247,83 @@ function scan(args) {
   return 0;
 }
 
+// --- fix -----------------------------------------------------------------
+//
+// The only command in this plugin that WRITES to a user's files, so every
+// choice here is defensive rather than convenient. `fix` deliberately
+// reuses scan's own file-reading machinery (readTarget, isBinary,
+// MAX_SCAN_BYTES) rather than a second, looser read path, because it must
+// inherit every edge case scan already learned to handle the hard way:
+//
+//   - A binary or oversize file is skipped, exactly like collect() skips it
+//     in scan - never partially rewritten. A partial rewrite of a binary
+//     file is data loss, not a fix.
+//   - loadAllowlist(root) runs ONCE, before the loop touches a single file.
+//     It throws on invalid JSON, an invalid regex or an unrecognized
+//     version - and because that throw happens before any writeFileSync,
+//     it propagates straight to main()'s catch (exit 2) having rewritten
+//     nothing. Rewriting files under a broken allowlist would be the worst
+//     possible combination this tool could produce, so the fix is
+//     structural: there is no code path between "allowlist failed to load"
+//     and "a file got rewritten."
+//   - A file whose hits are ALL allowlisted is `continue`d before the
+//     write, not rewritten-with-identical-content-and-restaged. The
+//     tests compare git blob hashes, not just file content, to hold this.
+//   - Only the exact [start, end) byte range findSecrets/tokenFor reported
+//     is replaced; every other byte survives untouched. Splicing via
+//     text.slice() rather than a global regex replace is what keeps a BOM,
+//     CRLF line endings and a missing trailing newline byte-identical on
+//     the way through - the same guarantee redactText() gives the hooks.
+//
+// fix rewrites the WORKTREE file (readTarget(..., staged: false)), because
+// that is the copy the user has open, then restages exactly that file with
+// `git add -- <rel>`.
+function fix(args) {
+  if (!args.includes("--staged")) {
+    process.stderr.write("[secret-gate] fix requires --staged. It will not rewrite unstaged files.\n");
+    return 2;
+  }
+  const root = repoRoot();
+  const allowlist = loadAllowlist(root); // throws -> propagates to main()'s catch, exit 2, nothing written yet
+  const lines = [];
+  let total = 0;
+
+  for (const rel of stagedPaths(root)) {
+    const target = readTarget(root, rel, false);
+    if (target.skip) continue; // unreadable/gone - nothing fix() can safely rewrite
+    const { buffer } = target;
+    if (buffer.length > MAX_SCAN_BYTES || isBinary(buffer)) continue;
+
+    const text = buffer.toString("utf8");
+    const hits = findSecrets(text).filter((hit) => !isAllowed(allowlist, rel, hit));
+    if (hits.length === 0) continue;
+
+    const state = newState();
+    let out = "";
+    let last = 0;
+    for (const hit of hits) {
+      out += text.slice(last, hit.start) + tokenFor(hit.value, hit.label, state);
+      last = hit.end;
+    }
+    writeFileSync(path.join(root, rel), Buffer.from(out + text.slice(last), "utf8"));
+
+    const added = git(["add", "--", rel], root);
+    if (added.status !== 0) throw new Error(`could not restage ${rel}`);
+
+    lines.push(`  ${rel}: ${hits.length} replaced (${[...new Set(hits.map((h) => h.label))].join(", ")})`);
+    total += hits.length;
+  }
+
+  if (total === 0) {
+    process.stdout.write("[secret-gate] nothing to fix.\n");
+    return 0;
+  }
+  process.stdout.write(
+    [`[secret-gate] rewrote ${total} value(s) to [REDACTED] markers and restaged:`, ...lines, ""].join("\n"),
+  );
+  return 0;
+}
+
 // --- entry point -------------------------------------------------------
 
 export async function main(argv = process.argv.slice(2)) {
@@ -227,6 +334,7 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     if (cmd === "scan") return scan(argv.slice(1));
+    if (cmd === "fix") return fix(argv.slice(1));
     process.stderr.write(USAGE);
     return 2;
   } catch (err) {
