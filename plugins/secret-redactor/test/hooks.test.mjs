@@ -7,6 +7,7 @@ import { runHook } from "./helpers/run-hook.mjs";
 
 const PLUGIN = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const TOKEN = "ghp_" + "f".repeat(36);
+const STRIPE_KEY = "sk_live_" + "a".repeat(20);
 
 test("PostToolUse: rewrites the result and reports the count", async () => {
   const { code, stdout, stderr } = await runHook("redact-tool-output.mjs", {
@@ -54,9 +55,10 @@ test("PostToolUse: ignores an event that is not its own", async () => {
 test("UserPromptSubmit: rewrites a pasted secret out of the prompt", async () => {
   const { code, stdout } = await runHook("redact-prompt.mjs", {
     hook_event_name: "UserPromptSubmit",
-    prompt: "put this in the env file: STRIPE_KEY=sk_live_aaaaaaaaaaaaaaaaaaaa",
+    prompt: "put this in the env file: STRIPE_KEY=" + STRIPE_KEY,
   });
   assert.equal(code, 0);
+  assert.ok(!stdout.includes(STRIPE_KEY), "the hook leaked the secret into its own output");
   const out = JSON.parse(stdout);
   assert.equal(out.hookSpecificOutput.hookEventName, "UserPromptSubmit");
   assert.match(out.hookSpecificOutput.updatedPrompt, /\[REDACTED stripe-key #1\]/);
@@ -76,7 +78,7 @@ test("UserPromptSubmit: says nothing for a clean prompt", async () => {
 test("UserPromptSubmit: #allow-secret is an escape hatch", async () => {
   const { code, stdout } = await runHook("redact-prompt.mjs", {
     hook_event_name: "UserPromptSubmit",
-    prompt: "#allow-secret STRIPE_KEY=sk_live_aaaaaaaaaaaaaaaaaaaa",
+    prompt: "#allow-secret STRIPE_KEY=" + STRIPE_KEY,
   });
   assert.equal(code, 0);
   assert.equal(stdout, "");
@@ -89,9 +91,15 @@ test("UserPromptSubmit: fails open on malformed stdin", async () => {
 });
 
 test("io.mjs MAX_BYTES cap: oversized input exits 0 with no output", async () => {
+  // 8.1 MB: reverse-engineered from pipe write failures at 8.5–9 MB in test harness.
+  // Payload is benign filler to exceed MAX_BYTES limit, with a real secret substring
+  // at the end. Cap present: read aborts before reaching secret → empty stdout.
+  // Cap removed: secret is found and redacted → output with rewrite (test fails).
+  const filler = "x".repeat(8 * 1024 * 1024);
   const largePayload =
     '{"hook_event_name":"PostToolUse","tool_name":"Test","tool_response":{"stdout":"' +
-    "x".repeat(8.1 * 1024 * 1024) +
+    filler +
+    STRIPE_KEY +
     '"}}';
   const { code, stdout } = await runHook("redact-tool-output.mjs", largePayload);
   assert.equal(code, 0);
@@ -109,3 +117,6 @@ test("hooks.json registers all three hooks against the right events", () => {
     assert.ok(commands.includes(script), script + " is not wired in hooks.json");
   }
 });
+
+
+
