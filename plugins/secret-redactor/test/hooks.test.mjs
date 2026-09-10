@@ -982,3 +982,69 @@ test("PreToolUse: GIT_CEILING_DIRECTORIES must not break repo discovery into a f
   const out = JSON.parse(stdout);
   assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
 });
+
+// --- Review round 2, Finding A (critical): the GIT_ prefix check was
+// case-sensitive; Windows environment lookup is not ----------------------
+//
+// gitEnv() stripped keys with `key.startsWith("GIT_")`. Object.keys()
+// returns environment variable names in whatever casing the process holds
+// them under, but the git.exe child resolves GIT_DIR (and friends) through
+// the Win32 environment block, which is case-insensitive - so a lowercase
+// or mixed-case name survives the strip untouched and git still reads it.
+// Same construction as the GIT_DIR/GIT_WORK_TREE hijack test above, just
+// with the env var names cased differently.
+function gitDirHijackEnv(targetRepo, poisonRepo, caseVariant) {
+  const names =
+    caseVariant === "lowercase"
+      ? { dir: "git_dir", workTree: "git_work_tree", indexFile: "git_index_file" }
+      : { dir: "Git_Dir", workTree: "Git_Work_Tree", indexFile: "Git_Index_File" };
+  return {
+    ...process.env,
+    [names.dir]: path.join(poisonRepo, ".git"),
+    [names.workTree]: poisonRepo,
+    [names.indexFile]: path.join(poisonRepo, ".git", "index"),
+  };
+}
+
+for (const caseVariant of ["lowercase", "mixed-case"]) {
+  test(`PreToolUse: ${caseVariant} git_dir/git_work_tree must not hijack which repo git answers about (Finding A)`, async () => {
+    const targetRepo = makeRepo({
+      ".gitignore": ".env.*\n",
+      ".env.production": "VITE_PUBLIC=1\n",
+    });
+    assert.ok(
+      isIgnoredByGit(targetRepo, ".env.production"),
+      "fixture premise broken: .gitignore does not match .env.production before it is force-tracked",
+    );
+    runGit(targetRepo, "add", "-f", ".env.production");
+    runGit(targetRepo, "commit", "-qm", "track env.production");
+
+    const poisonRepo = makeRepo({});
+
+    const { code, stdout } = await runHook(
+      "guard-write.mjs",
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: path.join(targetRepo, ".env.production"), content: "STRIPE_KEY=" + LIVE },
+      },
+      {
+        cwd: targetRepo,
+        env: gitDirHijackEnv(targetRepo, poisonRepo, caseVariant),
+      },
+    );
+    assert.equal(code, 0);
+    assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+    assert.notEqual(
+      stdout,
+      "",
+      `the write was allowed silently - ${caseVariant} GIT_DIR/GIT_WORK_TREE hijacked which repo git answered about`,
+    );
+    const out = JSON.parse(stdout);
+    assert.equal(
+      out.hookSpecificOutput.permissionDecision,
+      "deny",
+      `${caseVariant} GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE must not flip a tracked .env.production to an allow`,
+    );
+  });
+}

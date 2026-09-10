@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { loadAllowlist, isAllowed, staleEntries, fingerprintOf, ALLOWLIST_FILE } from "../lib/allowlist.mjs";
 import { makeRepo } from "./helpers/temp-repo.mjs";
@@ -73,6 +73,13 @@ test("an invalid regex throws with the pattern named", () => {
 // entirely. `paths: [""]` (an empty pattern) matches every path, so this is
 // the most permissive allowlist that can be written, deliberately, to make
 // the failure obvious rather than borderline.
+test("a gitignored .secretgate.json is treated as absent, not as a grant (Finding 3)", () => {
+  const dir = makeRepo({ ".gitignore": ALLOWLIST_FILE + "\n" });
+  writeFileSync(path.join(dir, ALLOWLIST_FILE), JSON.stringify({ version: 1, paths: [""] }));
+  const list = loadAllowlist(dir);
+  assert.equal(isAllowed(list, "src/app.ts", hit), false, "a gitignored allowlist must not grant any exemption");
+});
+
 // --- Review round 1, Finding 4: an unknown version is honored under v1
 // semantics instead of being rejected ------------------------------------
 //
@@ -86,9 +93,17 @@ test("an unrecognized version is rejected rather than honored under v1 rules", (
   assert.throws(() => loadAllowlist(dir), /version/i);
 });
 
-test("a gitignored .secretgate.json is treated as absent, not as a grant (Finding 3)", () => {
-  const dir = makeRepo({ ".gitignore": ALLOWLIST_FILE + "\n" });
-  writeFileSync(path.join(dir, ALLOWLIST_FILE), JSON.stringify({ version: 1, paths: [""] }));
-  const list = loadAllowlist(dir);
-  assert.equal(isAllowed(list, "src/app.ts", hit), false, "a gitignored allowlist must not grant any exemption");
+// --- Review round 2, Finding B (minor): a read failure was mislabeled as
+// invalid JSON ------------------------------------------------------------
+//
+// readFileSync sat inside the same try as JSON.parse, so an EACCES or a
+// locked file reported ".secretgate.json is not valid JSON: Error" - wrong
+// direction (it still denies either way) but wrong wording, sending an
+// operator hunting for a syntax error in a file they simply cannot open. A
+// directory in the file's place is a reliable, cross-platform way to force
+// a read failure (readFileSync throws EISDIR) without touching permissions.
+test("a .secretgate.json that cannot be read is reported as unreadable, not as invalid JSON", () => {
+  const dir = makeRepo({});
+  mkdirSync(path.join(dir, ALLOWLIST_FILE));
+  assert.throws(() => loadAllowlist(dir), /\.secretgate\.json could not be read/);
 });

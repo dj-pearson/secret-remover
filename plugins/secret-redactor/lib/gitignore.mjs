@@ -40,7 +40,15 @@ const GIT_TIMEOUT_MS = 5000;
 function gitEnv() {
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
-    if (key.startsWith("GIT_")) delete env[key];
+    // Case-INSENSITIVE on purpose: Object.keys() returns each variable in
+    // whatever casing the process happens to hold it under, but the git.exe
+    // child resolves GIT_DIR (and every other GIT_* var) case-insensitively
+    // through the Win32 environment block - so a `git_dir` or `Git_Dir`
+    // survived a `startsWith("GIT_")` check untouched and git still read
+    // it. The earlier three-name `delete env.GIT_DIR` had the identical
+    // gap; switching to a prefix check closed it for the class of variable
+    // names but not for the class of casings.
+    if (key.toUpperCase().startsWith("GIT_")) delete env[key];
   }
   return env;
 }

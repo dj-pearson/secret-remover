@@ -42,9 +42,22 @@ export function loadAllowlist(repoRoot) {
   const { available, ignored } = gitIgnores(file, repoRoot);
   if (!available || ignored) return empty;
 
+  // readFileSync and JSON.parse are deliberately separate try blocks. They
+  // used to share one, which reported a read failure (EACCES, a locked
+  // file, the path being a directory) as ".secretgate.json is not valid
+  // JSON" - technically still denies either way, since the caller treats
+  // any throw the same, but it sends whoever reads the message hunting for
+  // a syntax error in a file they cannot even open.
+  let raw;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (err) {
+    throw new Error(`${ALLOWLIST_FILE} could not be read: ${err.constructor.name}`);
+  }
+
   let parsed;
   try {
-    parsed = JSON.parse(readFileSync(file, "utf8"));
+    parsed = JSON.parse(raw);
   } catch (err) {
     // Deliberately not interpolating err.message: V8's own JSON.parse
     // SyntaxError echoes a snippet of the file's actual content for some
