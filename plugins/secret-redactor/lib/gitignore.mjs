@@ -10,22 +10,38 @@ import path from "node:path";
 const ENV_NAME = /(^|[/\\])\.env(\.|$)/;
 const GIT_TIMEOUT_MS = 5000;
 
-// Git sets GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE for every hook it runs,
-// and Tasks 9-11 vendor this code into repos where it runs FROM a pre-commit
-// hook - so a process environment that already carries those vars is the
-// normal case there, not an edge case. Left alone they override `cwd`
-// entirely: git answers about whatever repo GIT_DIR names, not the one this
-// module resolved and passed as `cwd`. Measured consequence: a secret
-// written into another repo's tracked .env.production reads as "outside the
-// repository" under the poisoned GIT_DIR, envExemption's git-unavailable
-// fallback exempts it by name alone, and a DENY silently becomes an ALLOW.
-// Stripping them before every spawnSync call is the fix; process.env itself
-// is never mutated, only the copy handed to the child.
+// Git sets a family of GIT_* variables for every hook it runs, and Tasks
+// 9-11 vendor this code into repos where it runs FROM a pre-commit hook - so
+// a process environment that already carries some of them is the normal
+// case there, not an edge case. Left alone, several of them override `cwd`
+// or repo discovery entirely, and each was measured to flip a DENY to a
+// silent ALLOW on its own:
+//   - GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE point git at a different repo
+//     than `cwd` names.
+//   - GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n and the single
+//     -c-equivalent GIT_CONFIG_PARAMETERS can set core.excludesFile to a
+//     file that ignores everything, so check-ignore reports an ordinary
+//     untracked file as ignored.
+//   - GIT_CEILING_DIRECTORIES set to the repo root stops git ascending INTO
+//     that root while discovering the repo from a nested subdirectory, so
+//     both check-ignore and rev-parse fail with "not a git repository" and
+//     envExemption's git-unavailable fallback exempts a tracked
+//     .env.production by name alone.
+// An earlier version of this function deleted exactly those first three by
+// name. That closed the vars the original report named and left every other
+// GIT_* variable open - GIT_CONFIG_PARAMETERS among them, which is not
+// exotic: git exports it to every hook invoked as `git -c key=value ...`,
+// precisely the vendored pre-commit case this code targets. Neither
+// check-ignore nor rev-parse --show-toplevel needs any GIT_* input, so
+// stripping the whole prefix costs nothing and closes the class rather than
+// a list - including GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY, and whatever git
+// adds next. process.env itself is never mutated, only the copy handed to
+// the child.
 function gitEnv() {
   const env = { ...process.env };
-  delete env.GIT_DIR;
-  delete env.GIT_WORK_TREE;
-  delete env.GIT_INDEX_FILE;
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("GIT_")) delete env[key];
+  }
   return env;
 }
 

@@ -81,16 +81,24 @@ if (oversizeBytes !== null) {
           // A malformed or invalid-regex .secretgate.json must NOT fail
           // open just because it means the harness couldn't decide what's
           // allowlisted - a broken allowlist is not permission to write a
-          // credential. loadAllowlist's own error message never contains
-          // file content (it's a JSON-parse or regex-compile error, not the
-          // .secretgate.json body), so it's safe to surface as-is.
+          // credential. Its error message is NOT safe to surface as-is,
+          // though a previous version of this comment claimed it was:
+          // lib/allowlist.mjs's compile() interpolates the raw pattern
+          // source into a bad-regex message (and a `regexes` entry is
+          // credential-adjacent by design - the whole point of the field is
+          // matching a value shaped like a key), and V8's own JSON.parse
+          // SyntaxError echoes a truncated prefix of the file's actual
+          // content when it fails early. Redact the message the same way
+          // the basename below is redacted, rather than trusting either
+          // source not to contain the very thing this plugin exists to keep
+          // out of a message.
           writeResult({
             systemMessage: `secret-redactor: blocked a write because ${ALLOWLIST_FILE} could not be read`,
             hookSpecificOutput: {
               hookEventName: "PreToolUse",
               permissionDecision: "deny",
               permissionDecisionReason:
-                `secret-gate: ${ALLOWLIST_FILE} is unreadable (${allowlistError.message}). ` +
+                `secret-gate: ${ALLOWLIST_FILE} is unreadable (${redactText(allowlistError.message)}). ` +
                 `Fix or remove it before writing credential-shaped content.`,
             },
           });

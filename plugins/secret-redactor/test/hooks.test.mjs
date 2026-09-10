@@ -702,6 +702,118 @@ test("PreToolUse: a malformed .secretgate.json denies rather than allowing", asy
   );
 });
 
+// --- Review round 1, Finding 2 (important): the unreadable-allowlist deny
+// message printed the allowlist file's OWN content verbatim -------------
+//
+// lib/allowlist.mjs's compile() interpolates the raw pattern source into its
+// thrown Error's message, and a `regexes` entry is credential-adjacent by
+// design (the brief's own example is a key prefix). A bad regex or bad JSON
+// in .secretgate.json must not become a channel for the very kind of value
+// this plugin exists to keep out of a transcript.
+const ALLOWLIST_SECRET = "sk_live_" + "d".repeat(20);
+
+test("PreToolUse: an invalid regex in .secretgate.json regexes must not leak the pattern (Finding 2a)", async () => {
+  const cwd = makeRepo({
+    [ALLOWLIST_FILE]: JSON.stringify({ version: 1, regexes: [ALLOWLIST_SECRET + "("] }),
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "notes.md"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(ALLOWLIST_SECRET), "the deny reason leaked the .secretgate.json regexes value");
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("PreToolUse: an invalid regex in .secretgate.json paths must not leak the pattern (Finding 2b)", async () => {
+  const cwd = makeRepo({
+    [ALLOWLIST_FILE]: JSON.stringify({ version: 1, paths: [ALLOWLIST_SECRET + "["] }),
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "notes.md"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(ALLOWLIST_SECRET), "the deny reason leaked the .secretgate.json paths value");
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("PreToolUse: invalid JSON starting with a secret-shaped value must not leak it via the parser's own snippet (Finding 2c)", async () => {
+  const cwd = makeRepo({
+    [ALLOWLIST_FILE]: ALLOWLIST_SECRET + " this is not json",
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "notes.md"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  // V8's own JSON.parse SyntaxError truncates to a short prefix rather than
+  // the full value - checking the FULL string never fails, since only the
+  // first 10 characters ever appear ("sk_live_dd..." for this fixture). That
+  // prefix is still a real leak, so pin the actual truncated snippet rather
+  // than the full value, which is distinct enough from every other
+  // sk_live_-prefixed fixture in this file (they all use a different
+  // repeated letter) not to false-match something unrelated.
+  const leakedPrefix = ALLOWLIST_SECRET.slice(0, 10);
+  assert.ok(
+    !stdout.includes(leakedPrefix),
+    "the deny reason leaked a snippet of the malformed JSON via the parser's own error message",
+  );
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+});
+
+// --- Review round 1, Finding 3 (important): a gitignored allowlist grants
+// exemptions it should not, end to end through the write guard -----------
+//
+// Reproduces the reviewer's own repro: a repo whose .gitignore lists
+// .secretgate.json, with that file present holding the most permissive
+// allowlist that can be written (`paths: [""]`, matching every path). It
+// must not silently allow a credential into an ordinary source file just
+// because nobody would ever see the allowlist that permitted it in a diff.
+test("PreToolUse: a gitignored .secretgate.json must not grant an exemption (Finding 3)", async () => {
+  const cwd = makeRepo({
+    ".gitignore": ALLOWLIST_FILE + "\n",
+    [ALLOWLIST_FILE]: JSON.stringify({ version: 1, paths: [""] }),
+    "src/.gitkeep": "",
+  });
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "src", "app.ts"), content: "STRIPE_KEY=" + LIVE },
+    },
+    { cwd },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  assert.notEqual(
+    stdout,
+    "",
+    "a gitignored .secretgate.json silently granted an exemption nobody would see in a diff",
+  );
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+});
+
 // --- Task 8: harden every git call against inherited GIT_* env vars --------
 
 // Git sets GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE for every hook it runs, and
@@ -758,4 +870,115 @@ test("PreToolUse: inherited GIT_DIR/GIT_WORK_TREE must not hijack which repo git
     "deny",
     "inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE must not flip a tracked .env.production to an allow",
   );
+});
+
+// --- Review round 1, Finding 1 (critical): closed by NAME, not by CLASS ---
+//
+// Naming exactly GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE closed those three and
+// left every other GIT_* variable git itself sets for a hook open. Each case
+// below is measured against its own control on the identical fixture: the
+// control denies, the poisoned env allows silently, and after stripping the
+// whole GIT_* prefix (rather than a list) both must deny.
+
+// Vector A: GIT_CONFIG_COUNT/KEY_0/VALUE_0 point core.excludesFile at a file
+// that ignores everything. check-ignore then reports an ordinary untracked
+// file as ignored, and envExemption treats "ignored" as exempt.
+test("PreToolUse: GIT_CONFIG_COUNT/KEY_0/VALUE_0 excludesFile override must not manufacture an exemption (Finding 1a)", async () => {
+  const cwd = makeRepo({});
+  const excludesFile = path.join(mkdtempSync(path.join(tmpdir(), "secret-gate-excludes-")), "exclude-all");
+  writeFileSync(excludesFile, "*\n");
+
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "src", "app.ts"), content: "STRIPE_KEY=" + LIVE },
+    },
+    {
+      cwd,
+      env: {
+        ...process.env,
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "core.excludesFile",
+        GIT_CONFIG_VALUE_0: excludesFile.replaceAll("\\", "/"),
+      },
+    },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  assert.notEqual(stdout, "", "GIT_CONFIG_COUNT/KEY_0/VALUE_0 manufactured a silent exemption");
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+});
+
+// Vector B: GIT_CONFIG_PARAMETERS is the single-variable encoding git itself
+// exports to every hook it invokes when the invoking command ran as
+// `git -c key=value ...` - not exotic, the normal shape of a hook's own
+// environment. Same excludesFile trick, different variable.
+test("PreToolUse: GIT_CONFIG_PARAMETERS excludesFile override must not manufacture an exemption (Finding 1b)", async () => {
+  const cwd = makeRepo({});
+  const excludesFile = path.join(mkdtempSync(path.join(tmpdir(), "secret-gate-excludes-")), "exclude-all");
+  writeFileSync(excludesFile, "*\n");
+
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(cwd, "src", "app.ts"), content: "STRIPE_KEY=" + LIVE },
+    },
+    {
+      cwd,
+      env: {
+        ...process.env,
+        GIT_CONFIG_PARAMETERS: `'core.excludesFile'='${excludesFile.replaceAll("\\", "/")}'`,
+      },
+    },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  assert.notEqual(stdout, "", "GIT_CONFIG_PARAMETERS manufactured a silent exemption");
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+});
+
+// Vector C: GIT_CEILING_DIRECTORIES set to the repo root itself stops git
+// from ascending INTO that directory while discovering the repo from a
+// nested subdirectory - repo discovery fails, both git calls report
+// "not a git repository", and envExemption's git-unavailable fallback
+// exempts a tracked .env.production by name alone.
+test("PreToolUse: GIT_CEILING_DIRECTORIES must not break repo discovery into a false exemption (Finding 1c)", async () => {
+  const targetRepo = makeRepo({
+    ".gitignore": ".env.*\n",
+    "sub/.gitkeep": "",
+    "sub/.env.production": "VITE_PUBLIC=1\n",
+  });
+  assert.ok(
+    isIgnoredByGit(targetRepo, "sub/.env.production"),
+    "fixture premise broken: .gitignore does not match sub/.env.production before it is force-tracked",
+  );
+  runGit(targetRepo, "add", "-f", "sub/.env.production");
+  runGit(targetRepo, "commit", "-qm", "track nested env.production");
+
+  const { code, stdout } = await runHook(
+    "guard-write.mjs",
+    {
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: path.join(targetRepo, "sub", ".env.production"), content: "STRIPE_KEY=" + LIVE },
+    },
+    {
+      cwd: targetRepo,
+      env: {
+        ...process.env,
+        GIT_CEILING_DIRECTORIES: targetRepo,
+      },
+    },
+  );
+  assert.equal(code, 0);
+  assert.ok(!stdout.includes(LIVE), "the deny reason leaked the value");
+  assert.notEqual(stdout, "", "GIT_CEILING_DIRECTORIES broke repo discovery into a silent exemption");
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
 });

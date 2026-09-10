@@ -1,12 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { loadAllowlist, isAllowed, staleEntries, fingerprintOf, ALLOWLIST_FILE } from "../lib/allowlist.mjs";
+import { makeRepo } from "./helpers/temp-repo.mjs";
 
+// loadAllowlist now checks whether .secretgate.json is itself git-tracked
+// (Finding 3), so every fixture needs a real repo, not a bare temp dir - a
+// plain directory reports "git could not answer" for every path, which
+// loadAllowlist treats the same as "ignored" (fail toward no exemptions).
 function repoWith(config) {
-  const dir = mkdtempSync(path.join(tmpdir(), "secret-gate-allow-"));
+  const dir = makeRepo({});
   if (config !== null) writeFileSync(path.join(dir, ALLOWLIST_FILE), JSON.stringify(config));
   return dir;
 }
@@ -48,7 +52,7 @@ test("an entry that matched nothing is reported as stale", () => {
 });
 
 test("invalid JSON throws with the file named and no secret in the message", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "secret-gate-allow-"));
+  const dir = makeRepo({});
   writeFileSync(path.join(dir, ALLOWLIST_FILE), "{ not json");
   assert.throws(() => loadAllowlist(dir), /\.secretgate\.json is not valid JSON/);
 });
@@ -56,4 +60,35 @@ test("invalid JSON throws with the file named and no secret in the message", () 
 test("an invalid regex throws with the pattern named", () => {
   const dir = repoWith({ version: 1, paths: ["["] });
   assert.throws(() => loadAllowlist(dir), /\[/);
+});
+
+// --- Review round 1, Finding 3 (important): a gitignored allowlist must
+// not be honored --------------------------------------------------------
+//
+// Any allowlist is self-service to something that can already write files,
+// so the one guarantee worth keeping is that USING it leaves a reviewable
+// artifact - a change that actually shows up in a diff someone looks at. A
+// .secretgate.json that git itself ignores can be written and consulted
+// without ever appearing in a commit, which defeats that guarantee
+// entirely. `paths: [""]` (an empty pattern) matches every path, so this is
+// the most permissive allowlist that can be written, deliberately, to make
+// the failure obvious rather than borderline.
+// --- Review round 1, Finding 4: an unknown version is honored under v1
+// semantics instead of being rejected ------------------------------------
+//
+// If a future v2 changes what `paths` (or any field) means, a guard that
+// still speaks v1 reading a v2 file would silently misinterpret it under
+// the wrong rules - an allow-direction failure that is invisible when it
+// happens, since nothing errors. Reject an unknown version the same way
+// malformed JSON is rejected, rather than defaulting past it.
+test("an unrecognized version is rejected rather than honored under v1 rules", () => {
+  const dir = repoWith({ version: 999, paths: ["^test/fixtures/"] });
+  assert.throws(() => loadAllowlist(dir), /version/i);
+});
+
+test("a gitignored .secretgate.json is treated as absent, not as a grant (Finding 3)", () => {
+  const dir = makeRepo({ ".gitignore": ALLOWLIST_FILE + "\n" });
+  writeFileSync(path.join(dir, ALLOWLIST_FILE), JSON.stringify({ version: 1, paths: [""] }));
+  const list = loadAllowlist(dir);
+  assert.equal(isAllowed(list, "src/app.ts", hit), false, "a gitignored allowlist must not grant any exemption");
 });
