@@ -4,10 +4,30 @@
 // GradeThread tracks .env.production and .env.example, so a name-only rule would
 // let a real key reach GitHub in the one place nobody would look for it.
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 const ENV_NAME = /(^|[/\\])\.env(\.|$)/;
 const GIT_TIMEOUT_MS = 5000;
+
+// Write routinely creates a brand new folder, and Claude Code always sends an
+// absolute file_path - so `path.dirname(filePath)` frequently names a
+// directory that does not exist YET. Handing that straight to spawnSync's
+// `cwd` makes it ENOENT (available:false), which used to fall through to the
+// same name-based exemption the cross-repo fix above was about, allowing a
+// real key into a not-yet-created .env.production. Climb to the nearest
+// directory that actually exists - that is still inside the target file's
+// own repo (the repo root itself always exists), so the cross-repo fix stays
+// intact; it just stops assuming the immediate parent exists too.
+function nearestExistingAncestor(dir) {
+  let current = dir;
+  while (!existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) return current; // hit the filesystem root; give up climbing
+    current = parent;
+  }
+  return current;
+}
 
 // exit 0 = ignored, exit 1 = not ignored, anything else = git could not answer.
 //
@@ -35,7 +55,7 @@ const GIT_TIMEOUT_MS = 5000;
 // deny. Timing the child out ourselves turns that into a fast, honest
 // "git could not answer" instead.
 export function gitIgnores(filePath, cwd) {
-  const dir = path.isAbsolute(filePath) ? path.dirname(filePath) : cwd;
+  const dir = path.isAbsolute(filePath) ? nearestExistingAncestor(path.dirname(filePath)) : cwd;
   const result = spawnSync("git", ["check-ignore", "--quiet", "--", filePath], {
     cwd: dir,
     timeout: GIT_TIMEOUT_MS,

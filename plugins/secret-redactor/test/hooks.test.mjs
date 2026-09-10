@@ -142,8 +142,17 @@ function isIgnoredByGit(cwd, relPath) {
 }
 
 test("PreToolUse: denies writing a secret into a tracked file", async () => {
+  // Finding B (round 2): `docs/` must actually exist on disk before this
+  // write. `makeRepo` only mkdirs for files it's given, so without an entry
+  // under `docs/` the target's parent directory would not exist yet, the
+  // guard would take the ENOENT fallback ("git could not answer"), and this
+  // test would keep passing for the wrong reason - a non-.env name denies
+  // either way, so it would pin nothing about the git-answered path it
+  // claims to cover. Asserting on the reason, not just the outcome, is what
+  // catches that.
   const cwd = makeRepo({
     ".gitignore": ".env\n.env.local\n",
+    "docs/.gitkeep": "",
   });
   const { code, stdout } = await runHook(
     "guard-write.mjs",
@@ -160,6 +169,11 @@ test("PreToolUse: denies writing a secret into a tracked file", async () => {
   assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
   assert.match(out.hookSpecificOutput.permissionDecisionReason, /stripe-key/);
   assert.match(out.hookSpecificOutput.permissionDecisionReason, /setup\.md/);
+  assert.match(
+    out.hookSpecificOutput.permissionDecisionReason,
+    /git tracks this path/,
+    "this test claims to cover the git-answered (not ENOENT-fallback) path",
+  );
 });
 
 test("PreToolUse: allows writing a secret into a gitignored .env", async () => {
@@ -502,5 +516,83 @@ test("PreToolUse: redacts a credential-shaped file name out of the deny message 
   assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
   assert.match(out.hookSpecificOutput.permissionDecisionReason, /\[REDACTED stripe-key #\d+\]/);
   assert.match(out.systemMessage, /\[REDACTED stripe-key #\d+\]/);
+});
+
+// --- Task 7 fix round 2: a sibling hole in the round-1 Critical fix --------
+
+// Finding A (critical, round 2): resolving git's cwd from the file's own
+// directory (round 1's Finding 1 fix) broke the moment that directory does
+// not exist yet. Write routinely creates a brand new folder, and Claude Code
+// always sends an absolute file_path, so this was not a corner case: it fired
+// on every real Write into a new folder. spawnSync ENOENTs, gitIgnores
+// reports available:false, and control fell through to the SAME name-based
+// exemption round 1's Finding 1 closed - through a different door.
+//
+// The two Criticals are in tension: a fix for "wrong repo" (round 1) can
+// silently reintroduce "wrong repo" (round 2) by falling back to the
+// session's cwd whenever the immediate parent is missing. This is tested as
+// a matrix rather than a single case for exactly that reason - each case
+// below isolates one axis (which repo, does the folder exist, is the path
+// actually ignored) so a fix that breaks one does not hide behind the others
+// passing.
+test("PreToolUse: a not-yet-existing folder does not disable the git answer (Finding A matrix)", async () => {
+  // .gitignore covers .env and .env.local by NAME only - not .env.production
+  // - and both patterns are depth-agnostic (no leading slash), so they also
+  // cover a nested path once that path is evaluated, even before the folder
+  // holding it exists on disk.
+  const repoA = makeRepo({ ".gitignore": ".env\n.env.local\n" });
+  const repoB = makeRepo({}); // a second, wholly unrelated repo used as "session cwd"
+  const secretContent = "STRIPE_KEY=" + LIVE;
+
+  const deny = async (filePath, cwd) => {
+    const { stdout } = await runHook(
+      "guard-write.mjs",
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: filePath, content: secretContent },
+      },
+      { cwd },
+    );
+    return stdout;
+  };
+
+  // Case 1: new folder, SAME repo as the session cwd. .env.production is not
+  // covered by the .gitignore, so this must deny regardless of whether the
+  // folder exists yet.
+  const case1 = await deny(path.join(repoA, "new-folder-1", ".env.production"), repoA);
+  assert.equal(
+    JSON.parse(case1).hookSpecificOutput.permissionDecision,
+    "deny",
+    "case 1 (new folder, same repo as session cwd) must deny",
+  );
+
+  // Case 2: new folder, DIFFERENT repo than the session cwd. The walk-up must
+  // land inside repoA (where the file actually lives, and whose nearest
+  // EXISTING ancestor is its own root), not fall back to repoB just because
+  // the immediate parent is missing.
+  const case2 = await deny(path.join(repoA, "new-folder-2", ".env.production"), repoB);
+  assert.equal(
+    JSON.parse(case2).hookSpecificOutput.permissionDecision,
+    "deny",
+    "case 2 (new folder, different repo than session cwd) must deny",
+  );
+
+  // Case 3: EXISTING folder, different repo than the session cwd. This is
+  // round 1's Finding 1 case, repeated here so the matrix stands on its own
+  // without depending on another test elsewhere in the file.
+  const case3 = await deny(path.join(repoA, ".env.production"), repoB);
+  assert.equal(
+    JSON.parse(case3).hookSpecificOutput.permissionDecision,
+    "deny",
+    "case 3 (existing folder, different repo than session cwd) must deny",
+  );
+
+  // Case 4: a genuinely gitignored .env file in a NEW folder must still be
+  // ALLOWED. This is the case a naive "when in doubt, deny" fix would break -
+  // the walk-up must not turn every .env* write into a deny regardless of
+  // whether it is actually ignored.
+  const case4 = await deny(path.join(repoA, "new-folder-3", ".env.local"), repoA);
+  assert.equal(case4, "", "case 4 (gitignored .env in a new folder) must stay silent");
 });
 

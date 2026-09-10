@@ -22,6 +22,14 @@ const input = await readStdinJson(MAX_BYTES, {
   },
 });
 
+// Everything below is nested inside these two conditions rather than a chain
+// of early `process.exit(0)` calls after the first write. `process.exit()`
+// can truncate a pending stdout write, so once writeResult() has run, the
+// script must fall off the end on its own (like the credential deny below
+// always has) instead of exiting explicitly. The other `process.exit(0)`
+// calls that used to be here were all silent, pre-write skips, which
+// `else if` / nested `if` reproduce exactly - they still print nothing and
+// still end the script, just without a call that could race a write.
 if (oversizeBytes !== null) {
   writeResult({
     systemMessage: `secret-redactor: refused a write too large to scan for credentials (${oversizeBytes} bytes)`,
@@ -33,42 +41,43 @@ if (oversizeBytes !== null) {
         `so it cannot be checked for credentials. Split it into smaller writes.`,
     },
   });
-  process.exit(0);
+} else if (input && input.hook_event_name === "PreToolUse") {
+  const toolInput = input.tool_input ?? {};
+  // file_path/notebook_path may not be a string at all if tool_input is
+  // malformed; coerce so downstream .replaceAll()/path.basename() calls can't
+  // throw and turn a would-be deny into a silent allow via an uncaught
+  // rejection (io.mjs's handler exits 0 on those).
+  const rawFilePath = toolInput.file_path ?? toolInput.notebook_path ?? "";
+  const filePath = typeof rawFilePath === "string" ? rawFilePath : "";
+  const content = toolInput.content ?? toolInput.new_string ?? toolInput.new_source ?? "";
+
+  if (typeof content === "string" && content.length > 0) {
+    const hits = findSecrets(content);
+
+    if (hits.length > 0) {
+      const { exempt, reason } = envExemption(filePath, process.cwd());
+
+      if (!exempt) {
+        const shown = hits.slice(0, 3).map((h) => `${h.label} at line ${h.line}`).join(", ");
+        const more = hits.length > 3 ? `, and ${hits.length - 3} more` : "";
+        // The basename itself can be credential-shaped (a pasted key used as
+        // a filename). "Never print a secret value" has no exceptions, so
+        // redact it same as any other text before it goes into the deny
+        // message.
+        const name = filePath ? redactText(path.basename(filePath)) : "this file";
+
+        writeResult({
+          systemMessage: `secret-redactor: blocked a write of ${hits.length} credential(s) into ${name}`,
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason:
+              `secret-gate: this would write ${shown}${more} into ${name} (${reason}). ` +
+              `Put the value in a gitignored .env file and reference it by name instead. ` +
+              `If it is a fixture, add it to .secretgate.json first.`,
+          },
+        });
+      }
+    }
+  }
 }
-
-if (!input || input.hook_event_name !== "PreToolUse") process.exit(0);
-
-const toolInput = input.tool_input ?? {};
-// file_path/notebook_path may not be a string at all if tool_input is
-// malformed; coerce so downstream .replaceAll()/path.basename() calls can't
-// throw and turn a would-be deny into a silent allow via an uncaught
-// rejection (io.mjs's handler exits 0 on those).
-const rawFilePath = toolInput.file_path ?? toolInput.notebook_path ?? "";
-const filePath = typeof rawFilePath === "string" ? rawFilePath : "";
-const content = toolInput.content ?? toolInput.new_string ?? toolInput.new_source ?? "";
-if (typeof content !== "string" || content.length === 0) process.exit(0);
-
-const hits = findSecrets(content);
-if (hits.length === 0) process.exit(0);
-
-const { exempt, reason } = envExemption(filePath, process.cwd());
-if (exempt) process.exit(0);
-
-const shown = hits.slice(0, 3).map((h) => `${h.label} at line ${h.line}`).join(", ");
-const more = hits.length > 3 ? `, and ${hits.length - 3} more` : "";
-// The basename itself can be credential-shaped (a pasted key used as a
-// filename). "Never print a secret value" has no exceptions, so redact it
-// same as any other text before it goes into the deny message.
-const name = filePath ? redactText(path.basename(filePath)) : "this file";
-
-writeResult({
-  systemMessage: `secret-redactor: blocked a write of ${hits.length} credential(s) into ${name}`,
-  hookSpecificOutput: {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason:
-      `secret-gate: this would write ${shown}${more} into ${name} (${reason}). ` +
-      `Put the value in a gitignored .env file and reference it by name instead. ` +
-      `If it is a fixture, add it to .secretgate.json first.`,
-  },
-});
