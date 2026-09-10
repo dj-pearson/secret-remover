@@ -224,6 +224,7 @@ export function redactText(text, state = newState()) {
 // hook that emits an identity rewrite races last-write-wins against a sibling
 // hook doing a real redaction.
 export function redactDeep(value, state = newState()) {
+  const startLength = state.hits.length;
   const walk = (node) => {
     if (typeof node === "string") return redactText(node, state);
     if (Array.isArray(node)) return node.map(walk);
@@ -235,7 +236,9 @@ export function redactDeep(value, state = newState()) {
     return node;
   };
   const redacted = walk(value);
-  return { value: state.hits.length ? redacted : value, total: state.hits.length, hits: state.hits };
+  const delta = state.hits.length - startLength;
+  const newHits = state.hits.slice(startLength);
+  return { value: delta ? redacted : value, total: delta, hits: newHits };
 }
 
 export function summarize(hits) {

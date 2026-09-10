@@ -125,3 +125,32 @@ test("a shared state numbers values consistently across calls", () => {
   assert.ok(b.includes("#1"));
   assert.equal(state.hits.length, 1);
 });
+
+test("redactDeep with a shared state returns the original reference on clean second call", () => {
+  const state = newState();
+  const token = "ghp_" + "x".repeat(36);
+  redactDeep({ stdout: "token=" + token }, state);
+  assert.equal(state.hits.length, 1);
+
+  const input = { stdout: "all good", exitCode: 0 };
+  const { value, total } = redactDeep(input, state);
+  assert.equal(total, 0, "second call found no new secrets");
+  assert.equal(value, input, "must return the original reference, not a copy");
+});
+
+test("redaction is idempotent for all detector labels", () => {
+  for (const label of DETECTOR_LABELS) {
+    const marker = `[REDACTED ${label} #1]`;
+    const once = redactText(marker);
+    const twice = redactText(once);
+    assert.equal(twice, once, `marker for ${label} should not be re-detected`);
+  }
+});
+
+test("URL_PASSWORD redaction is idempotent across full database URLs", () => {
+  const url = "postgres://admin:SecurePassword123@db.internal:5432/app";
+  const once = redactText(url);
+  const twice = redactText(once);
+  assert.equal(twice, once, "redacted URL should not be re-detected on second pass");
+  assert.ok(once.includes("[REDACTED url-password #1]"), "first redaction should succeed");
+});
