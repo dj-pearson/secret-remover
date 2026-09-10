@@ -14,11 +14,11 @@
 // as a warning and lets the commit through, because a crashing scanner must not
 // brick committing in twenty repos. CI treats 2 as a failure, because there the
 // right response to a broken scanner is a red build.
-import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, lstatSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { findSecrets, newState, tokenFor, MAX_SCAN_BYTES } from "./detect.mjs";
+import { findSecrets, newState, redactRanges, MAX_SCAN_BYTES } from "./detect.mjs";
 import { loadAllowlist, isAllowed, staleEntries, ALLOWLIST_FILE } from "./allowlist.mjs";
 import { gitEnv } from "./gitignore.mjs";
 
@@ -250,78 +250,190 @@ function scan(args) {
 // --- fix -----------------------------------------------------------------
 //
 // The only command in this plugin that WRITES to a user's files, so every
-// choice here is defensive rather than convenient. `fix` deliberately
-// reuses scan's own file-reading machinery (readTarget, isBinary,
-// MAX_SCAN_BYTES) rather than a second, looser read path, because it must
-// inherit every edge case scan already learned to handle the hard way:
+// choice here is defensive rather than convenient.
 //
-//   - A binary or oversize file is skipped, exactly like collect() skips it
-//     in scan - never partially rewritten. A partial rewrite of a binary
-//     file is data loss, not a fix.
-//   - loadAllowlist(root) runs ONCE, before the loop touches a single file.
-//     It throws on invalid JSON, an invalid regex or an unrecognized
-//     version - and because that throw happens before any writeFileSync,
-//     it propagates straight to main()'s catch (exit 2) having rewritten
-//     nothing. Rewriting files under a broken allowlist would be the worst
-//     possible combination this tool could produce, so the fix is
-//     structural: there is no code path between "allowlist failed to load"
-//     and "a file got rewritten."
-//   - A file whose hits are ALL allowlisted is `continue`d before the
-//     write, not rewritten-with-identical-content-and-restaged. The
-//     tests compare git blob hashes, not just file content, to hold this.
-//   - Only the exact [start, end) byte range findSecrets/tokenFor reported
-//     is replaced; every other byte survives untouched. Splicing via
-//     text.slice() rather than a global regex replace is what keeps a BOM,
-//     CRLF line endings and a missing trailing newline byte-identical on
-//     the way through - the same guarantee redactText() gives the hooks.
+// FINDINGS from Task 10 review round 1, all fixed here:
 //
-// fix rewrites the WORKTREE file (readTarget(..., staged: false)), because
-// that is the copy the user has open, then restages exactly that file with
-// `git add -- <rel>`.
+//   1 (CRITICAL) fix used to decode with buffer.toString("utf8") and write
+//     the decoded string back. For a file that is not valid UTF-8 (a
+//     Latin-1/CP1252 config file, say) that decode is LOSSY - every invalid
+//     byte becomes U+FFFD on the way in, and writing the string back turns
+//     each one into the 3-byte UTF-8 encoding of U+FFFD on the way out.
+//     Content OUTSIDE the finding changed, silently, and `git add` carried
+//     the corruption into the index. Fixed by round-tripping every staged
+//     buffer through Buffer.from(text, "utf8").equals(buffer) before ever
+//     writing it - a file that fails that check is refused, not rewritten.
+//   2 (CRITICAL) fix decided from the WORKTREE, scanned from the STAGED
+//     blob, and assumed they matched. When they don't - hand-edited after
+//     staging, deleted after staging, or partially staged with `git add
+//     -p` - fix either reported "nothing to fix" while a credential stayed
+//     in the index, or promoted deliberately-unstaged content into the
+//     commit unannounced. Fixed by finding hits in the STAGED blob (so a
+//     deleted-from-worktree file is still caught) and refusing to touch
+//     anything whose worktree bytes don't exactly equal its staged bytes.
+//     This is the cheap, safe half of the fix: REFUSE on divergence rather
+//     than attempt to redact the index blob directly (that needs its own
+//     task - hash-object -w plus update-index --cacheinfo, with its own
+//     review).
+//   3 fix wrote THROUGH a symlink: readFileSync/writeFileSync on a tracked
+//     symlink pointing outside the repo reads and rewrites the link's
+//     TARGET, which `git show` (the index blob is just link text) never
+//     sees and `scan --staged` therefore never flags. lstatSync(...).isFile()
+//     gates the write; anything else (symlink, directory, fifo) is skipped.
+//   4 `args.includes("--staged")` was the only inspection fix did of its
+//     own argv - `fix --staged --dry-run some/path.md` silently rewrote
+//     every staged finding in the whole repo. fix takes exactly one flag;
+//     anything else is now a usage error (exit 2).
+//   5 scan's report() lists every skip; fix's did not, so a file skipped
+//     for being binary/oversize/invalid-UTF-8/a-symlink/diverged vanished
+//     from the output with no way to tell "skipped" from "genuinely clean."
+//     Every skip reason below is now collected into the same kind of skip
+//     list scan already prints.
+//   6 a mid-loop failure (an unwritable worktree file, `git add` failing)
+//     used to throw straight out of the file loop, discarding the summary
+//     of files already rewritten-and-restaged earlier in the same run. A
+//     write/restage failure is now itself a per-file skip: the loop keeps
+//     going, and whatever succeeded before or after it is still reported.
+//
+// Exit code: 0 only when every finding in scope was either fixed or was
+// never a problem (fully allowlisted). 1 when a real, unresolved finding
+// remains (invalid UTF-8, a symlink, staged/worktree divergence, a write
+// failure) - the caller must not read fix's exit 0 as "the repo is now
+// clean" unless it also reruns scan, same as this file's own remediation
+// text already tells them to. 2 is reserved for usage errors and for
+// repoRoot()/loadAllowlist()/stagedPaths() failing before any file is
+// touched.
 function fix(args) {
+  const KNOWN_FLAGS = new Set(["--staged"]);
+  const unknown = args.find((a) => !KNOWN_FLAGS.has(a));
+  if (unknown !== undefined) {
+    process.stderr.write(`[secret-gate] fix: unrecognized argument '${unknown}'. Usage: fix --staged\n`);
+    return 2;
+  }
   if (!args.includes("--staged")) {
     process.stderr.write("[secret-gate] fix requires --staged. It will not rewrite unstaged files.\n");
     return 2;
   }
+
   const root = repoRoot();
   const allowlist = loadAllowlist(root); // throws -> propagates to main()'s catch, exit 2, nothing written yet
   const lines = [];
+  const skipped = [];
   let total = 0;
+  let unresolved = 0;
 
   for (const rel of stagedPaths(root)) {
-    const target = readTarget(root, rel, false);
-    if (target.skip) continue; // unreadable/gone - nothing fix() can safely rewrite
-    const { buffer } = target;
-    if (buffer.length > MAX_SCAN_BYTES || isBinary(buffer)) continue;
+    // Finding 2: hits are found in the STAGED blob, not the worktree copy -
+    // scan --staged is the promise fix is keeping, and the staged blob is
+    // the only copy that promise is actually about.
+    const stagedTarget = readTarget(root, rel, true);
+    if (stagedTarget.skip) {
+      skipped.push(stagedTarget.skip);
+      continue;
+    }
+    const stagedBuffer = stagedTarget.buffer;
 
-    const text = buffer.toString("utf8");
-    const hits = findSecrets(text).filter((hit) => !isAllowed(allowlist, rel, hit));
-    if (hits.length === 0) continue;
+    if (stagedBuffer.length > MAX_SCAN_BYTES) {
+      skipped.push(`${rel} (${stagedBuffer.length} bytes, over the ${MAX_SCAN_BYTES} byte limit)`);
+      continue;
+    }
+    if (isBinary(stagedBuffer)) {
+      skipped.push(`${rel} (binary)`);
+      continue;
+    }
+
+    const stagedText = stagedBuffer.toString("utf8");
+    const hits = findSecrets(stagedText).filter((hit) => !isAllowed(allowlist, rel, hit));
+    if (hits.length === 0) continue; // no unresolved finding here - nothing to report either
+
+    // Finding 1: refuse rather than corrupt. A file that round-trips
+    // cleanly through UTF-8 gets its bytes back unchanged outside the
+    // hits; one that doesn't would silently mangle every invalid byte,
+    // not just the ones inside a finding.
+    if (!Buffer.from(stagedText, "utf8").equals(stagedBuffer)) {
+      skipped.push(`${rel} (not valid UTF-8 - rewriting it would corrupt bytes outside the finding, left as-is)`);
+      unresolved++;
+      continue;
+    }
+
+    const abs = path.join(root, rel);
+
+    // Finding 3: a tracked symlink's worktree entry is the link, not the
+    // target - lstat (which does NOT follow the link) before anything that
+    // would (readFileSync/writeFileSync both follow it).
+    let lst;
+    try {
+      lst = lstatSync(abs);
+    } catch {
+      // Finding 2, case C: staged content exists (we already have a real
+      // hit in stagedBuffer) but the worktree copy is gone.
+      skipped.push(`${rel}: staged content differs from the worktree (the file is missing) - fix cannot rewrite it safely`);
+      unresolved++;
+      continue;
+    }
+    if (!lst.isFile()) {
+      skipped.push(`${rel} (not a regular file on disk - e.g. a symlink - fix will not follow it)`);
+      unresolved++;
+      continue;
+    }
+
+    let worktreeBuffer;
+    try {
+      worktreeBuffer = readFileSync(abs);
+    } catch (err) {
+      skipped.push(`${rel} (worktree copy could not be read: ${err.code ?? err.constructor.name})`);
+      unresolved++;
+      continue;
+    }
+
+    // Finding 2, cases A and B: the worktree was hand-edited, or only part
+    // of it was staged. Either way the two copies disagree, and rewriting
+    // the worktree and restaging it would carry whatever it now holds -
+    // including content that was deliberately left unstaged - into the
+    // index. Refuse rather than guess which copy the user meant.
+    if (!worktreeBuffer.equals(stagedBuffer)) {
+      skipped.push(`${rel}: staged content differs from the worktree - fix cannot rewrite it safely`);
+      unresolved++;
+      continue;
+    }
 
     const state = newState();
-    let out = "";
-    let last = 0;
-    for (const hit of hits) {
-      out += text.slice(last, hit.start) + tokenFor(hit.value, hit.label, state);
-      last = hit.end;
-    }
-    writeFileSync(path.join(root, rel), Buffer.from(out + text.slice(last), "utf8"));
+    const rewritten = redactRanges(stagedText, hits, state);
 
-    const added = git(["add", "--", rel], root);
-    if (added.status !== 0) throw new Error(`could not restage ${rel}`);
+    // Finding 6: a write or restage failure demotes this file to a skip
+    // instead of throwing out of the loop, so files handled earlier (or
+    // later) in the same run are still rewritten, restaged and reported.
+    try {
+      writeFileSync(abs, Buffer.from(rewritten, "utf8"));
+      const added = git(["add", "--", rel], root);
+      if (added.status !== 0) {
+        throw new Error(added.error ? (added.error.code ?? added.error.message) : "git add failed");
+      }
+    } catch (err) {
+      skipped.push(`${rel} (could not be rewritten/restaged: ${err.code ?? err.message})`);
+      unresolved++;
+      continue;
+    }
 
     lines.push(`  ${rel}: ${hits.length} replaced (${[...new Set(hits.map((h) => h.label))].join(", ")})`);
     total += hits.length;
   }
 
-  if (total === 0) {
-    process.stdout.write("[secret-gate] nothing to fix.\n");
-    return 0;
+  // Finding 5: report skips the way scan's report() does, not silently.
+  const out = [];
+  if (total > 0) {
+    out.push(`[secret-gate] rewrote ${total} value(s) to [REDACTED] markers and restaged:`, ...lines, "");
+  } else if (skipped.length === 0) {
+    out.push("[secret-gate] nothing to fix.");
   }
-  process.stdout.write(
-    [`[secret-gate] rewrote ${total} value(s) to [REDACTED] markers and restaged:`, ...lines, ""].join("\n"),
-  );
-  return 0;
+  if (skipped.length > 0) {
+    out.push(`[secret-gate] skipped ${skipped.length} file(s):`);
+    for (const s of skipped) out.push(`  ${s}`);
+    out.push("");
+  }
+  if (out.length > 0) process.stdout.write(out.join("\n") + "\n");
+
+  return unresolved > 0 ? 1 : 0;
 }
 
 // --- entry point -------------------------------------------------------

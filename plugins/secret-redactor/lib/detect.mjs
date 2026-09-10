@@ -208,8 +208,13 @@ export function tokenFor(value, label, state) {
   return token;
 }
 
-export function redactText(text, state = newState()) {
-  const hits = findSecrets(text);
+// Splices a [REDACTED <label> #n] marker into `text` at each hit's
+// [start, end) range and leaves every other byte untouched - the ONE place
+// this plugin turns a list of hits into rewritten text. redactText() below
+// and cli.mjs's `fix` command (which filters hits through the allowlist
+// first) both call this rather than each keeping their own copy of the
+// same slice/tokenFor/last sequence.
+export function redactRanges(text, hits, state) {
   if (hits.length === 0) return text;
   let out = "";
   let last = 0;
@@ -218,6 +223,10 @@ export function redactText(text, state = newState()) {
     last = hit.end;
   }
   return out + text.slice(last);
+}
+
+export function redactText(text, state = newState()) {
+  return redactRanges(text, findSecrets(text), state);
 }
 
 // Returns the ORIGINAL value when nothing was found. Callers rely on this: a
