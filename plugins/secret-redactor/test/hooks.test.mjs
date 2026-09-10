@@ -51,6 +51,53 @@ test("PostToolUse: ignores an event that is not its own", async () => {
   assert.equal(stdout, "");
 });
 
+test("UserPromptSubmit: rewrites a pasted secret out of the prompt", async () => {
+  const { code, stdout } = await runHook("redact-prompt.mjs", {
+    hook_event_name: "UserPromptSubmit",
+    prompt: "put this in the env file: STRIPE_KEY=sk_live_aaaaaaaaaaaaaaaaaaaa",
+  });
+  assert.equal(code, 0);
+  const out = JSON.parse(stdout);
+  assert.equal(out.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+  assert.match(out.hookSpecificOutput.updatedPrompt, /\[REDACTED stripe-key #1\]/);
+  assert.match(out.hookSpecificOutput.updatedPrompt, /^put this in the env file: /);
+  assert.match(out.systemMessage, /1 secret redacted from your prompt/);
+});
+
+test("UserPromptSubmit: says nothing for a clean prompt", async () => {
+  const { code, stdout } = await runHook("redact-prompt.mjs", {
+    hook_event_name: "UserPromptSubmit",
+    prompt: "run the tests and tell me what broke",
+  });
+  assert.equal(code, 0);
+  assert.equal(stdout, "");
+});
+
+test("UserPromptSubmit: #allow-secret is an escape hatch", async () => {
+  const { code, stdout } = await runHook("redact-prompt.mjs", {
+    hook_event_name: "UserPromptSubmit",
+    prompt: "#allow-secret STRIPE_KEY=sk_live_aaaaaaaaaaaaaaaaaaaa",
+  });
+  assert.equal(code, 0);
+  assert.equal(stdout, "");
+});
+
+test("UserPromptSubmit: fails open on malformed stdin", async () => {
+  const { code, stdout } = await runHook("redact-prompt.mjs", "}}}not json");
+  assert.equal(code, 0);
+  assert.equal(stdout, "");
+});
+
+test("io.mjs MAX_BYTES cap: oversized input exits 0 with no output", async () => {
+  const largePayload =
+    '{"hook_event_name":"PostToolUse","tool_name":"Test","tool_response":{"stdout":"' +
+    "x".repeat(8.1 * 1024 * 1024) +
+    '"}}';
+  const { code, stdout } = await runHook("redact-tool-output.mjs", largePayload);
+  assert.equal(code, 0);
+  assert.equal(stdout, "");
+});
+
 test("hooks.json registers all three hooks against the right events", () => {
   const cfg = JSON.parse(readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8"));
   assert.ok(cfg.hooks.PostToolUse, "PostToolUse is not registered");
