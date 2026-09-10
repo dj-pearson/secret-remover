@@ -91,11 +91,11 @@ test("UserPromptSubmit: fails open on malformed stdin", async () => {
 });
 
 test("io.mjs MAX_BYTES cap: oversized input exits 0 with no output", async () => {
-  // 8.1 MB: reverse-engineered from pipe write failures at 8.5–9 MB in test harness.
-  // Payload is benign filler to exceed MAX_BYTES limit, with a real secret substring
-  // at the end. Cap present: read aborts before reaching secret → empty stdout.
-  // Cap removed: secret is found and redacted → output with rewrite (test fails).
-  const filler = "x".repeat(8 * 1024 * 1024);
+  // MAX_BYTES is 8388608. Payload 8388700 bytes exceeds limit by 92 bytes.
+  // Cap present: read aborts when size exceeds MAX_BYTES, returns null, hook exits 0.
+  // Cap removed: secret at end would be found and redacted (test would fail).
+  // The 92-byte cushion avoids pipe buffer issues while proving the cap works.
+  const filler = "x".repeat(8388700 - 80 - 28);
   const largePayload =
     '{"hook_event_name":"PostToolUse","tool_name":"Test","tool_response":{"stdout":"' +
     filler +
