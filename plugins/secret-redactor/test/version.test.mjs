@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { VERSION } from "../lib/cli.mjs";
 
 const PLUGIN = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const ROOT = path.dirname(path.dirname(PLUGIN));
@@ -19,6 +20,16 @@ test("the three version strings agree", () => {
 
   assert.equal(manifest.version, pkg.version);
   assert.equal(entry.version, pkg.version);
+});
+
+// lib/cli.mjs's VERSION is a fourth place this can drift: `install` (Task
+// 11) stamps it into every repo it vendors into, so a mismatch here means a
+// vendored repo reports the wrong version and its own staleness check goes
+// quiet without anyone noticing. Not pinned to a literal - the contract is
+// mutual agreement, because the version is bumped on every release.
+test("lib/cli.mjs's VERSION agrees with package.json", () => {
+  const pkg = read(path.join(PLUGIN, "package.json"));
+  assert.equal(VERSION, pkg.version);
 });
 
 test("the marketplace is named pearson-media and points at the plugin", () => {

@@ -37,7 +37,11 @@ const GIT_TIMEOUT_MS = 5000;
 // a list - including GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY, and whatever git
 // adds next. process.env itself is never mutated, only the copy handed to
 // the child.
-function gitEnv() {
+// Exported so lib/cli.mjs (Task 9) can reuse the exact same stripping for
+// every git call it makes, rather than carrying a second copy of this list.
+// This hole has been closed three times in this plugin now; one function is
+// one thing to keep correct.
+export function gitEnv() {
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
     // Case-INSENSITIVE on purpose: Object.keys() returns each variable in
