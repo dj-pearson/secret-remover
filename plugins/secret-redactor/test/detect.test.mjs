@@ -141,9 +141,7 @@ test("redactDeep with a shared state returns the original reference on clean sec
 test("redaction is idempotent for all detector labels", () => {
   for (const label of DETECTOR_LABELS) {
     const marker = `[REDACTED ${label} #1]`;
-    const once = redactText(marker);
-    const twice = redactText(once);
-    assert.equal(twice, once, `marker for ${label} should not be re-detected`);
+    assert.equal(redactText(marker), marker, `marker for ${label} should not be modified`);
   }
 });
 
