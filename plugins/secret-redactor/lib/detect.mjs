@@ -20,6 +20,8 @@ const LITERAL = /^(?:null|undefined|true|false|none|nil|empty|unset|not|n\/a)$/i
 const PLACEHOLDER =
   /(?:^|[_\-.])(?:your|here|changeme|change_me|placeholder|redacted|todo|insert|xxxx+)(?:$|[_\-.])|placeholder|changeme|x{6,}|\*{4,}/i;
 const OPENERS = new Set(["$", "<", "(", "[", "{", "/", "\\", ".", "~", "-", "#", "%", "@", "|", "'", '"', "`"]);
+const MARKDOWN_EMPHASIS = /\*\*|__/;
+const CAPITALIZED_WORD = /^[A-Z][a-z]+$/;
 
 export function looksLikeSecret(value) {
   if (typeof value !== "string" || value.length < 8 || value.length > 512) return false;
@@ -29,6 +31,8 @@ export function looksLikeSecret(value) {
   if (DOTTED_CODE.test(value)) return false;
   if (LITERAL.test(value)) return false;
   if (PLACEHOLDER.test(value)) return false;
+  if (MARKDOWN_EMPHASIS.test(value)) return false;
+  if (CAPITALIZED_WORD.test(value)) return false;
   if (UUID.test(value) || GIT_SHA.test(value) || INTEGRITY.test(value)) return false;
   if (/^(.)\1*$/.test(value)) return false;
   return /[0-9]/.test(value) || (/[a-z]/.test(value) && /[A-Z]/.test(value));
@@ -61,15 +65,42 @@ const DETECTORS = [
 ];
 
 const URL_PASSWORD = /([a-z][a-z0-9+.-]*:\/\/[^\s:@/]{1,64}:)([^\s@/]{3,256})@/gi;
+
+// Stock example connection strings (postgres://user:pass@..., mysql://root:root@...)
+// use a short placeholder word as the password, so a plain length/digit floor
+// can't tell them apart from a real short database password. looksLikeSecret's
+// 8-char floor is no help either - it would reject legitimate short passwords
+// too, which is exactly why this detector has its own guard instead of
+// delegating like BEARER and LABELED do. Reject the placeholder words by name
+// instead.
+const URL_PASSWORD_PLACEHOLDERS = new Set([
+  "pass",
+  "password",
+  "passwd",
+  "test",
+  "demo",
+  "admin",
+  "root",
+  "user",
+  "username",
+  "secret",
+  "changeme",
+  "example",
+  "dbpass",
+]);
 const BEARER = /\b([Bb]earer\s+)([A-Za-z0-9_\-.=+/]{20,})/g;
 
 const SECRET_WORD =
   "secret|token|passwd|password|pwd|api[_-]?key|apikey|access[_-]?key|private[_-]?key|credential|auth|session[_-]?id";
 
-// Task 3 tightens this. Keep it as-is for now so the corpus positive pass is
-// what turns green here, and the negative pass is what turns green there.
+// Separator must be an explicit `:` or `=`. A bare run of whitespace used to be
+// allowed and it matched across blank lines, so a paragraph ending in the word
+// "tokens." swallowed the first word of the next paragraph. Observed on this
+// plugin's own README, 2026-09-10.
+//
+// `.` is out of the key class for the same reason: it let `tokens.` be a key.
 const LABELED = new RegExp(
-  `([A-Za-z0-9_.-]*(?:${SECRET_WORD})[A-Za-z0-9_.-]*)(["'\`]?\\s*[:=]\\s*|\\s+)(["'\`]?)([^\\s"'\`,;)\\]}]{8,})\\3`,
+  `([A-Za-z0-9_-]*(?:${SECRET_WORD})[A-Za-z0-9_-]*)(["'\`]?[ \\t]*[:=][ \\t]*)(["'\`]?)([^\\s"'\`,;)\\]}]{8,})\\3`,
   "gi",
 );
 
@@ -131,6 +162,7 @@ export function findSecrets(text) {
 
   for (const m of text.matchAll(URL_PASSWORD)) {
     const value = m[2];
+    if (URL_PASSWORD_PLACEHOLDERS.has(value.toLowerCase())) continue;
     if (value.length < 4 && !/[0-9]/.test(value)) continue;
     push(m.index + m[1].length, "url-password", value);
   }

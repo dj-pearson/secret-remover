@@ -1,0 +1,53 @@
+### positives - one per label, each must be found. Every value below is
+### synthetic (hand-built to satisfy a detector's shape) and opens nothing.
+
+private-key:
+-----BEGIN PRIVATE KEY-----
+MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEAyntheticExampleKeyMaterialOnly0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ
+-----END PRIVATE KEY-----
+
+aws-access-key-id: AKIAIOSFODNN7EXAMPLE
+github-token: ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6
+github-token-fine: github_pat_11AbCdEfGhIjKlMnOpQrStUvWxYz01
+stripe-key: sk_TEST_live_AbCdEfGhIjKlMnOpQrSt
+anthropic-key: sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz
+openai-key: sk-proj-AbCdEfGhIjKlMnOpQrStUvWx
+google-api-key: AIza1234567890abcdefghijklmnopqrstuvwxy
+slack-token: xoxb-123456789012345
+slack-webhook: https://hooks.slack.com/test-services/T00000000/B00000000/AbCdEfGhIjKlMnOpQrSt1234
+npm-token: npm_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789
+pypi-token: pypi-AgEIcHlwaS5vcmcCJGZha2V0b2tlbmZvcnRlc3Rpbmc
+sendgrid-key: SG.AbCdEfGhIjKlMnOp.QrStUvWxYzAbCdEf
+twilio-sid: AC_TEST_0123456789abcdef0123456789abcdef
+discord-token: M_TEST_AbCdEfGhIjKlMnOpQrStUvW.XyZ012.AbCdEfGhIjKlMnOpQrStUvWxYzAb
+jwt: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.AbCdEfGhIjKlMnOpQrSt
+url-password: postgres://admin:h3nrY8Qz2w@db.internal:5432/app
+bearer-token: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz0123456789
+labeled-secret: AbCdEfGhIjKlMnOpQrSt1234
+
+### negatives - none of these may be found
+
+A sentence that ends in a word about tokens.
+
+**Structural shapes** - PEM private key blocks (whole block, not just the
+header), JWTs, Bearer tokens, and passwords inside a URL.
+
+**Labeled values** - anything assigned to a key whose name contains secret.
+
+const key = process.env.API_KEY;
+export PASSWORD="${DB_PASSWORD}"
+api_key: your-api-key-here
+password: changeme
+token: <insert-token>
+STRIPE_KEY=sk_TEST_test_0123456789abcdefghijklmn
+commit 1a2b3c4d5e6f7890abcdef1234567890abcdef12
+uuid 550e8400-e29b-41d4-a716-446655440000
+integrity sha512-abcdefghijklmnopqrstuvwxyz0123456789
+secret: null
+auth = undefined
+The password is in the vault, ask the owner.
+
+postgres://user:pass@localhost/db
+mysql://root:root@localhost:3306/app
+redis://:test@cache.local:6379
+mongodb://admin:admin@mongo:27017
