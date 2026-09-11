@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+# >>> secret-gate __VERSION__
+# Blocks a commit that stages a plaintext credential.
+#
+# Exit 1 from the scanner means findings, and the commit is refused.
+# Any other non-zero exit means the scanner itself broke. That warns and lets
+# the commit through on purpose: a crashing scanner must not brick committing.
+# The CI job runs the same scan and does treat that as a failure.
+if command -v node >/dev/null 2>&1; then
+  node "$(git rev-parse --show-toplevel)/scripts/secret-gate/cli.mjs" scan --staged
+  __secret_gate_status=$?
+  if [ "$__secret_gate_status" -eq 1 ]; then
+    exit 1
+  fi
+  if [ "$__secret_gate_status" -ne 0 ]; then
+    echo "[secret-gate] scanner error (exit $__secret_gate_status) - allowing the commit. CI will still check."
+  fi
+else
+  echo "[secret-gate] node not found - skipping the local scan. CI will still check."
+fi
+# <<< secret-gate

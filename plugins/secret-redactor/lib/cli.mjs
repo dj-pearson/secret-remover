@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // lib/cli.mjs
 //
-// scan / fix / install. This file plus detect.mjs and allowlist.mjs are what
-// `install` vendors into a repo, so the three of them import each other with
+// scan / fix / install. This file plus its whole relative-import closure
+// (detect.mjs, allowlist.mjs, gitignore.mjs - see VENDORED_FILES below) is
+// what `install` vendors into a repo, so all of them import each other with
 // plain relative paths and nothing else.
 //
 // Exit codes:
@@ -14,10 +15,10 @@
 // as a warning and lets the commit through, because a crashing scanner must not
 // brick committing in twenty repos. CI treats 2 as a failure, because there the
 // right response to a broken scanner is a red build.
-import { existsSync, readFileSync, writeFileSync, statSync, lstatSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, lstatSync, mkdirSync, copyFileSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { findSecrets, newState, redactRanges, MAX_SCAN_BYTES } from "./detect.mjs";
 import { loadAllowlist, isAllowed, staleEntries, ALLOWLIST_FILE } from "./allowlist.mjs";
 import { gitEnv } from "./gitignore.mjs";
@@ -523,6 +524,148 @@ function fix(args) {
   return unresolved > 0 ? 1 : 0;
 }
 
+// --- install ---------------------------------------------------------------
+//
+// Vendors this library into a target repo as plain, dependency-free files so
+// the gate belongs to the REPO, not to a machine that happens to have this
+// plugin installed - it has to work in CI, in a fresh clone, and for someone
+// who does not use Claude Code at all.
+//
+// VENDORED_FILES is the import closure of this file, not a hand-picked list.
+// Vendoring three files (detect, allowlist, cli) shipped once already and
+// made every install DOA the moment allowlist.mjs and this file itself
+// started importing gitEnv/gitIgnores from gitignore.mjs: the vendored copy
+// of cli.mjs failed on its very first run, in every installed repo, with
+// Cannot find module './gitignore.mjs'. Closing that by name (adding
+// "gitignore.mjs" to a literal array) fixes today; the exported constant
+// here plus test/cli-install.test.mjs's closure-derivation test is what
+// keeps the next added import from repeating it a fourth time.
+export const VENDORED_FILES = ["detect.mjs", "allowlist.mjs", "gitignore.mjs", "cli.mjs"];
+
+const MARK_START = "# >>> secret-gate";
+const MARK_END = "# <<< secret-gate";
+const VENDOR_DIR = path.join("scripts", "secret-gate");
+const LF_RULE = ".githooks/** text eol=lf";
+
+function here() {
+  return path.dirname(fileURLToPath(import.meta.url));
+}
+
+function template(name) {
+  const file = path.join(here(), "..", "templates", name);
+  if (!existsSync(file)) {
+    throw new Error(
+      "templates/ is missing. Run `install` from the plugin, not from a vendored scripts/secret-gate/ copy.",
+    );
+  }
+  return readFileSync(file, "utf8").replaceAll("__VERSION__", VERSION).replaceAll("\r\n", "\n");
+}
+
+function writeLf(file, contents) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, contents.replaceAll("\r\n", "\n"), { encoding: "utf8" });
+}
+
+function spliceHook(existing, block) {
+  const start = existing.indexOf(MARK_START);
+  const end = existing.indexOf(MARK_END);
+  if (start !== -1 && end !== -1 && end > start) {
+    return existing.slice(0, start) + block.trim() + existing.slice(end + MARK_END.length);
+  }
+  return existing.replace(/\s*$/, "") + "\n\n" + block.trim() + "\n";
+}
+
+function stampOf(text) {
+  const match = text.match(/secret-gate (\d+\.\d+\.\d+)/);
+  return match ? match[1] : null;
+}
+
+function install(args) {
+  const force = args.includes("--force");
+  const root = repoRoot();
+  const notes = [];
+
+  // 1. vendor the library's actual import closure plus a version stamp
+  const vendorTarget = path.join(root, VENDOR_DIR);
+  mkdirSync(vendorTarget, { recursive: true });
+  for (const name of VENDORED_FILES) {
+    copyFileSync(path.join(here(), name), path.join(vendorTarget, name));
+  }
+  writeFileSync(path.join(vendorTarget, "VERSION"), VERSION + "\n");
+  notes.push(`vendored ${VENDOR_DIR}/ at ${VERSION}`);
+
+  // 2. allowlist, never clobbered without --force
+  const allowFile = path.join(root, ALLOWLIST_FILE);
+  if (!existsSync(allowFile) || force) {
+    writeLf(allowFile, template("secretgate.json"));
+    notes.push(`wrote ${ALLOWLIST_FILE}`);
+  } else {
+    notes.push(`kept your existing ${ALLOWLIST_FILE}`);
+  }
+
+  // 3. pre-commit, spliced between markers so a sibling hook survives
+  const hookFile = path.join(root, ".githooks", "pre-commit");
+  const full = template("pre-commit");
+  const block = full.slice(full.indexOf(MARK_START));
+  if (existsSync(hookFile)) {
+    writeLf(hookFile, spliceHook(readFileSync(hookFile, "utf8"), block));
+    notes.push("updated the secret-gate block in .githooks/pre-commit, left the rest alone");
+  } else {
+    writeLf(hookFile, full);
+    notes.push("wrote .githooks/pre-commit");
+  }
+  try {
+    chmodSync(hookFile, 0o755);
+  } catch {
+    // Windows has no exec bit. git handles it on checkout.
+  }
+
+  // 4. CI workflow, rewritten only when its stamp is older
+  const wfFile = path.join(root, ".github", "workflows", "secret-gate.yml");
+  const wf = template("workflow.yml");
+  if (!existsSync(wfFile) || force || stampOf(readFileSync(wfFile, "utf8")) !== VERSION) {
+    writeLf(wfFile, wf);
+    notes.push("wrote .github/workflows/secret-gate.yml");
+  } else {
+    notes.push("workflow already at " + VERSION);
+  }
+
+  // 5. LF pin. A CRLF shebang breaks git-for-windows sh.
+  const attrFile = path.join(root, ".gitattributes");
+  const attrs = existsSync(attrFile) ? readFileSync(attrFile, "utf8") : "";
+  if (!attrs.includes(LF_RULE)) {
+    writeLf(attrFile, attrs.replace(/\s*$/, "") + (attrs.trim() ? "\n" : "") + LF_RULE + "\n");
+    notes.push("pinned .githooks/** to LF in .gitattributes");
+  }
+
+  // 6. hooksPath, only when it is unset or already ours
+  const current = git(["config", "--get", "core.hooksPath"], root);
+  const value = current.status === 0 ? current.stdout.trim() : "";
+  if (value === "" || value === ".githooks") {
+    git(["config", "core.hooksPath", ".githooks"], root);
+    notes.push("set core.hooksPath to .githooks");
+  } else {
+    notes.push(
+      `LEFT ALONE: core.hooksPath is ${value}, not .githooks. ` +
+        `Wire .githooks/pre-commit into ${value} yourself, or run: git config core.hooksPath .githooks`,
+    );
+  }
+
+  process.stdout.write(
+    [
+      `[secret-gate] installed ${VERSION} into ${root}`,
+      ...notes.map((n) => "  " + n),
+      "",
+      "Commit the new files so the gate travels with the repo:",
+      `  git add ${VENDOR_DIR} ${ALLOWLIST_FILE} .githooks .github/workflows/secret-gate.yml .gitattributes`,
+      "",
+      "On another clone of this repo, run:  git config core.hooksPath .githooks",
+      "",
+    ].join("\n"),
+  );
+  return 0;
+}
+
 // --- entry point -------------------------------------------------------
 
 export async function main(argv = process.argv.slice(2)) {
@@ -534,6 +677,7 @@ export async function main(argv = process.argv.slice(2)) {
     }
     if (cmd === "scan") return scan(argv.slice(1));
     if (cmd === "fix") return fix(argv.slice(1));
+    if (cmd === "install") return install(argv.slice(1));
     process.stderr.write(USAGE);
     return 2;
   } catch (err) {

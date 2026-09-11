@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Pre-commit secret scan (US-272).
+set -euo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "[pre-commit] gitleaks not installed - skipping local secret scan."
+  exit 0
+fi
+
+echo "[pre-commit] Scanning staged changes for secrets..."
+if ! gitleaks protect --staged --redact --config .gitleaks.toml; then
+  echo "[pre-commit] BLOCKED: a potential secret was found in your staged changes."
+  exit 1
+fi
+
+echo "[pre-commit] No secrets detected."
