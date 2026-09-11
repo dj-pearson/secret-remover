@@ -15,8 +15,8 @@ test("the three version strings agree", () => {
   const manifest = read(path.join(PLUGIN, ".claude-plugin", "plugin.json"));
   const market = read(path.join(ROOT, ".claude-plugin", "marketplace.json"));
 
-  const entry = market.plugins.find((p) => p.name === "secret-redactor");
-  assert.ok(entry, "secret-redactor is missing from marketplace.json");
+  const entry = market.plugins.find((p) => p.name === "secret-remover");
+  assert.ok(entry, "secret-remover is missing from marketplace.json");
 
   assert.equal(manifest.version, pkg.version);
   assert.equal(entry.version, pkg.version);
@@ -35,8 +35,8 @@ test("lib/cli.mjs's VERSION agrees with package.json", () => {
 test("the marketplace is named secret-remover and points at the plugin", () => {
   const market = read(path.join(ROOT, ".claude-plugin", "marketplace.json"));
   assert.equal(market.name, "secret-remover");
-  const entry = market.plugins.find((p) => p.name === "secret-redactor");
-  assert.equal(entry.source, "./plugins/secret-redactor");
+  const entry = market.plugins.find((p) => p.name === "secret-remover");
+  assert.equal(entry.source, "./plugins/secret-remover");
 });
 
 test("the plugin declares zero dependencies", () => {

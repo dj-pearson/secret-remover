@@ -1,10 +1,10 @@
 {
-  "name": "secret-redactor",
-  "version": "2.1.0",
+  "name": "secret-remover",
+  "version": "2.2.0",
   "type": "module",
   "description": "Claude Code hooks plus a commit gate that keep plaintext credentials out of transcripts and out of GitHub.",
   "license": "MIT",
-  "homepage": "https://github.com/dj-pearson/claude-secret-remover/tree/main/plugins/secret-redactor",
+  "homepage": "https://github.com/dj-pearson/claude-secret-remover/tree/main/plugins/secret-remover",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/dj-pearson/claude-secret-remover.git"

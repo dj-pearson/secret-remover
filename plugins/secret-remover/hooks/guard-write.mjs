@@ -34,7 +34,7 @@ const input = await readStdinJson(MAX_BYTES, {
 // still end the script, just without a call that could race a write.
 if (oversizeBytes !== null) {
   writeResult({
-    systemMessage: `secret-redactor: refused a write too large to scan for credentials (${oversizeBytes} bytes)`,
+    systemMessage: `secret-remover: refused a write too large to scan for credentials (${oversizeBytes} bytes)`,
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
@@ -94,7 +94,7 @@ if (oversizeBytes !== null) {
           // source not to contain the very thing this plugin exists to keep
           // out of a message.
           writeResult({
-            systemMessage: `secret-redactor: blocked a write because ${ALLOWLIST_FILE} could not be read`,
+            systemMessage: `secret-remover: blocked a write because ${ALLOWLIST_FILE} could not be read`,
             hookSpecificOutput: {
               hookEventName: "PreToolUse",
               permissionDecision: "deny",
@@ -126,7 +126,7 @@ if (oversizeBytes !== null) {
             const name = filePath ? redactText(path.basename(filePath)) : "this file";
 
             writeResult({
-              systemMessage: `secret-redactor: blocked a write of ${survivingHits.length} credential(s) into ${name}`,
+              systemMessage: `secret-remover: blocked a write of ${survivingHits.length} credential(s) into ${name}`,
               hookSpecificOutput: {
                 hookEventName: "PreToolUse",
                 permissionDecision: "deny",

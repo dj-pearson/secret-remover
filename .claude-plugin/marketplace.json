@@ -5,19 +5,22 @@
     "url": "https://github.com/dj-pearson"
   },
   "metadata": {
-    "description": "Claude Code plugins used across the Pearson Media portfolio",
+    "description": "Keeps plaintext credentials out of Claude Code transcripts, out of files, and out of GitHub.",
     "version": "1.0.0"
+  },
+  "renames": {
+    "secret-redactor": "secret-remover"
   },
   "plugins": [
     {
-      "name": "secret-redactor",
-      "source": "./plugins/secret-redactor",
-      "version": "2.1.0",
+      "name": "secret-remover",
+      "source": "./plugins/secret-remover",
+      "version": "2.2.0",
       "description": "Keeps plaintext credentials out of transcripts, out of files, and out of GitHub.",
       "author": {
         "name": "Pearson Media LLC"
       },
-      "homepage": "https://github.com/dj-pearson/claude-secret-remover/tree/main/plugins/secret-redactor",
+      "homepage": "https://github.com/dj-pearson/claude-secret-remover/tree/main/plugins/secret-remover",
       "repository": "https://github.com/dj-pearson/claude-secret-remover",
       "license": "MIT",
       "category": "security",
