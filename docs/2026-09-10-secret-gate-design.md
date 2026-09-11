@@ -4,6 +4,11 @@ Date: 2026-09-10
 Status: approved, ready for implementation planning
 Owner: Pearson Media LLC
 
+> Note (2026-09-10, Task 12): the repo this plan built toward shipped as
+> `dj-pearson/claude-secret-remover`, not `pearson-claude-plugins` as named
+> below. The rest of this document is the historical record of what was
+> decided that day and is left as written.
+
 ## Problem
 
 A credential pasted in plain text into a repo document reaches GitHub. Nothing
