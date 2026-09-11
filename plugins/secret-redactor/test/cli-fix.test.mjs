@@ -389,9 +389,18 @@ test("a stray path argument makes fix exit 2 rather than silently scoping (or fa
 // FINDING 6: a mid-loop write/restage failure used to throw straight out of
 // the loop, discarding the report of files already handled. Made read-only
 // via the Windows file attribute (chmodSync 0o444), which really does make
-// writeFileSync fail with EPERM here (verified separately) - unlike POSIX
+// writeFileSync fail with EPERM there (verified separately) - unlike POSIX
 // permission bits, this does not depend on which user owns the file.
-test("a write failure on one file does not swallow the report of another file already fixed in the same run (Finding 6)", () => {
+//
+// On POSIX it DOES depend on that: root ignores the read-only bit entirely,
+// so writeFileSync succeeds, nothing fails mid-loop, and the assertion below
+// reports a failure that says nothing about this plugin. CI runs as an
+// unprivileged user on all three platforms, so the contract stays asserted
+// there; skipping under root only stops a developer container (this repo's
+// own agent sandbox runs as root) from reading a green suite as red.
+const cannotBeMadeReadOnly = process.platform !== "win32" && typeof process.getuid === "function" && process.getuid() === 0;
+
+test("a write failure on one file does not swallow the report of another file already fixed in the same run (Finding 6)", { skip: cannotBeMadeReadOnly ? "running as root: chmod 0444 does not deny root a write" : false }, () => {
   const dir = makeRepo({
     "ok.md": "STRIPE_KEY=" + LIVE + "\n",
     "readonly.md": "STRIPE_KEY=" + LIVE + "\n",

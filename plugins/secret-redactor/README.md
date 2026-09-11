@@ -90,7 +90,7 @@ itself can't answer (no repo, a timeout) and the path is `.env`-shaped.
 
 Running `install` (or `/secret-gate install`) in a repo writes:
 
-- `scripts/secret-gate/{detect,allowlist,gitignore,cli}.mjs` plus a `VERSION`
+- `scripts/secret-gate/{detect,allowlist,gitignore,paths,cli}.mjs` plus a `VERSION`
   stamp - the actual import closure of the CLI, vendored so the gate belongs
   to the repo (works in CI, in a fresh clone, for someone without this
   plugin) rather than to a machine that happens to have it installed.

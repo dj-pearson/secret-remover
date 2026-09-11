@@ -7,6 +7,7 @@ import { readStdinJson, writeResult, MAX_BYTES } from "./io.mjs";
 import { findSecrets, redactText } from "../lib/detect.mjs";
 import { envExemption, repoRootFor } from "../lib/gitignore.mjs";
 import { loadAllowlist, isAllowed, ALLOWLIST_FILE } from "../lib/allowlist.mjs";
+import { canonicalizeParent } from "../lib/paths.mjs";
 
 // Oversized input is a special case for THIS hook only: a throw or malformed
 // stdin still fails open (the hook is broken; don't brick the session), but
@@ -103,7 +104,16 @@ if (oversizeBytes !== null) {
             },
           });
         } else {
-          const relPath = allowlist && repoRoot ? path.relative(repoRoot, path.resolve(filePath)).replaceAll("\\", "/") : null;
+          // canonicalizeParent(), not path.resolve() alone: repoRoot came
+          // from git and filePath came from the tool call, and the two spell
+          // the same directory differently wherever a symlink (macOS /var ->
+          // /private/var), an 8.3 short name or a casing difference (Windows)
+          // sits in the path. That made path.relative() return a "../../.."
+          // escape, which matched no `paths` entry, so an explicitly
+          // allowlisted fixture was denied. Only the parent is canonicalized -
+          // git tracks a symlink as a symlink, and following the final
+          // component would allowlist by the link's target instead.
+          const relPath = allowlist && repoRoot ? path.relative(repoRoot, canonicalizeParent(filePath)).replaceAll("\\", "/") : null;
           const survivingHits = allowlist ? hits.filter((hit) => !isAllowed(allowlist, relPath, hit)) : hits;
 
           if (survivingHits.length > 0) {

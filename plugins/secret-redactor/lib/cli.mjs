@@ -18,12 +18,13 @@
 import { existsSync, readFileSync, writeFileSync, statSync, lstatSync, mkdirSync, copyFileSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import { pathToFileURL, fileURLToPath } from "node:url";
+import { fileURLToPath } from "node:url";
 import { findSecrets, newState, redactRanges, MAX_SCAN_BYTES } from "./detect.mjs";
 import { loadAllowlist, isAllowed, staleEntries, ALLOWLIST_FILE } from "./allowlist.mjs";
 import { gitEnv } from "./gitignore.mjs";
+import { canonicalize, canonicalizeParent, samePath } from "./paths.mjs";
 
-export const VERSION = "2.0.0";
+export const VERSION = "2.1.0";
 
 const USAGE = `usage: secret-gate <command>
 
@@ -49,10 +50,16 @@ function git(args, cwd, encoding = "utf8") {
   return spawnSync("git", args, { cwd, encoding, env: gitEnv(), maxBuffer: MAX_SCAN_BYTES * 4 });
 }
 
+// Canonicalized on the way out, not returned as git spelled it. Everything
+// downstream either joins a repo-relative path onto this or path.relative()s
+// a Node-built absolute path against it, and git and Node disagree about how
+// to spell the same directory on macOS (/var vs /private/var) and Windows
+// (8.3 short names, casing). See lib/paths.mjs - canonicalizing both sides is
+// the only thing that makes those comparisons mean what they read as.
 export function repoRoot(cwd = process.cwd()) {
   const result = git(["rev-parse", "--show-toplevel"], cwd);
   if (result.status !== 0) throw new Error("not a git repository");
-  return result.stdout.trim();
+  return canonicalize(result.stdout.trim());
 }
 
 function stagedPaths(root) {
@@ -110,7 +117,17 @@ function resolveExplicitPaths(root, cwd, args) {
     // through, and it degraded further downstream into a plain ENOENT skip
     // (path.join glues an absolute Windows path onto the repo root, which
     // resolves nowhere) - exit 0 instead of exit 2.
-    const relRaw = path.relative(root, abs);
+    //
+    // canonicalizeParent(), not the raw `abs`: `root` came from git, `abs`
+    // came from path.resolve(process.cwd(), ...), and on macOS those are
+    // /private/var/... and /var/... for the same directory (on Windows, the
+    // long and 8.3 spellings). path.relative() between the two spellings
+    // returns a "../../.." escape, which this function then correctly - and
+    // uselessly - reports as "outside the repository", refusing to scan a
+    // file that is plainly inside it. Only the parent is canonicalized: git
+    // tracks a symlink as a symlink, and resolving the final component would
+    // silently scan the link's target instead of the path that was asked for.
+    const relRaw = path.relative(root, canonicalizeParent(abs));
     if (path.isAbsolute(relRaw)) {
       throw new Error(`${arg}: outside the repository`);
     }
@@ -540,7 +557,7 @@ function fix(args) {
 // "gitignore.mjs" to a literal array) fixes today; the exported constant
 // here plus test/cli-install.test.mjs's closure-derivation test is what
 // keeps the next added import from repeating it a fourth time.
-export const VENDORED_FILES = ["detect.mjs", "allowlist.mjs", "gitignore.mjs", "cli.mjs"];
+export const VENDORED_FILES = ["detect.mjs", "allowlist.mjs", "gitignore.mjs", "paths.mjs", "cli.mjs"];
 
 const MARK_START = "# >>> secret-gate";
 const MARK_END = "# <<< secret-gate";
@@ -856,12 +873,26 @@ export async function main(argv = process.argv.slice(2)) {
   }
 }
 
-// pathToFileURL handles the drive-letter and separator differences a
-// hand-built `file://${...}` template can get wrong. That matters here
-// specifically because a mismatch fails open: if this comparison is ever
-// wrong, `invokedDirectly` is false, `main()` never runs, and the process
-// exits 0 having scanned nothing.
-const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+// A mismatch here fails OPEN: `invokedDirectly` goes false, `main()` never
+// runs, and the process exits 0 having scanned nothing - a pre-commit gate
+// that is silently not a gate, in every repo it was vendored into.
+//
+// The previous version compared `import.meta.url` against
+// pathToFileURL(process.argv[1]) verbatim, and that is exactly the failure it
+// warned about. Node resolves a module specifier through realpath before
+// recording import.meta.url, while argv[1] is whatever the caller typed. Any
+// symlink or alias anywhere in the path makes the two differ:
+//
+//   macOS   node /var/folders/x/T/repo/scripts/secret-gate/cli.mjs
+//           -> import.meta.url is file:///private/var/folders/x/T/repo/...
+//   Windows node C:\Users\RUNNER~1\...\cli.mjs
+//           -> import.meta.url is file:///C:/Users/runneradmin/...
+//
+// In both cases the gate ran, printed nothing, and exited 0 on a staged live
+// credential. Canonicalize argv[1] the same way Node canonicalized the module
+// URL, and compare with the platform's own case rules.
+const entryPath = typeof process.argv[1] === "string" && process.argv[1].length > 0 ? process.argv[1] : null;
+const invokedDirectly = entryPath !== null && samePath(canonicalize(entryPath), fileURLToPath(import.meta.url));
 
 if (invokedDirectly) {
   main().then((code) => process.exit(code));

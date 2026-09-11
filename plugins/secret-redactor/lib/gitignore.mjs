@@ -6,6 +6,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { canonicalize, canonicalizeParent } from "./paths.mjs";
 
 const ENV_NAME = /(^|[/\\])\.env(\.|$)/;
 const GIT_TIMEOUT_MS = 5000;
@@ -102,7 +103,7 @@ function nearestExistingAncestor(dir) {
 // deny. Timing the child out ourselves turns that into a fast, honest
 // "git could not answer" instead.
 export function gitIgnores(filePath, cwd) {
-  const dir = path.isAbsolute(filePath) ? nearestExistingAncestor(path.dirname(filePath)) : cwd;
+  const dir = canonicalize(path.isAbsolute(filePath) ? nearestExistingAncestor(path.dirname(filePath)) : cwd);
   const result = spawnSync("git", ["check-ignore", "--quiet", "--", filePath], {
     cwd: dir,
     timeout: GIT_TIMEOUT_MS,
@@ -125,7 +126,7 @@ export function gitIgnores(filePath, cwd) {
 // so a caller can fall back to "no allowlist" the same way envExemption
 // falls back to the .env name rule.
 export function repoRootFor(filePath, cwd) {
-  const dir = path.isAbsolute(filePath) ? nearestExistingAncestor(path.dirname(filePath)) : cwd;
+  const dir = canonicalize(path.isAbsolute(filePath) ? nearestExistingAncestor(path.dirname(filePath)) : cwd);
   const result = spawnSync("git", ["rev-parse", "--show-toplevel"], {
     cwd: dir,
     timeout: GIT_TIMEOUT_MS,
@@ -134,7 +135,15 @@ export function repoRootFor(filePath, cwd) {
   });
   if (result.error || result.status !== 0 || typeof result.stdout !== "string") return null;
   const root = result.stdout.trim();
-  return root.length > 0 ? root : null;
+  // Canonicalized before it leaves this function: the write guard
+  // path.relative()s a Node-built absolute file path against this root to
+  // get the repo-relative path it matches .secretgate.json `paths` entries
+  // against, and git and Node spell the same directory differently on macOS
+  // (/private/var vs /var) and Windows (long vs 8.3, casing). Uncanonicalized,
+  // that relative path came out as "../../../../var/folders/.../fixture.txt",
+  // matched no allowlist entry, and the guard denied a write the repo had
+  // explicitly allowed. See lib/paths.mjs.
+  return root.length > 0 ? canonicalize(root) : null;
 }
 
 // `rawFilePath` may not be a string at all (a malformed tool_input can hand
