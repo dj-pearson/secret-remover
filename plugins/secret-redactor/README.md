@@ -37,7 +37,7 @@ Three names are involved, and each belongs to a different command:
 | Name | What it is | Command that uses it |
 |---|---|---|
 | `claude-secret-remover` | the GitHub repo | `claude plugin marketplace add dj-pearson/claude-secret-remover` |
-| `pearson-media` | the marketplace (`.claude-plugin/marketplace.json`) | `claude plugin marketplace update pearson-media` |
+| `secret-remover` | the marketplace (`.claude-plugin/marketplace.json`) | `claude plugin marketplace update secret-remover` |
 | `secret-redactor` | this plugin | `claude plugin install secret-redactor` |
 
 ```bash

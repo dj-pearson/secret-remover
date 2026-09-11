@@ -32,9 +32,9 @@ test("lib/cli.mjs's VERSION agrees with package.json", () => {
   assert.equal(VERSION, pkg.version);
 });
 
-test("the marketplace is named pearson-media and points at the plugin", () => {
+test("the marketplace is named secret-remover and points at the plugin", () => {
   const market = read(path.join(ROOT, ".claude-plugin", "marketplace.json"));
-  assert.equal(market.name, "pearson-media");
+  assert.equal(market.name, "secret-remover");
   const entry = market.plugins.find((p) => p.name === "secret-redactor");
   assert.equal(entry.source, "./plugins/secret-redactor");
 });
