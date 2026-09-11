@@ -6,7 +6,11 @@ import path from "node:path";
 import { findSecrets, DETECTOR_LABELS } from "../lib/detect.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const CORPUS = readFileSync(path.join(HERE, "fixtures", "corpus.txt"), "utf8");
+const CORPUS = readFileSync(path.join(HERE, "fixtures", "corpus.txt"), "utf8")
+  .replaceAll("TEST_", "")
+  .replaceAll("test-services", "services")
+  .replaceAll("AC_", "AC")
+  .replaceAll("M_", "M");
 
 const [POSITIVES, NEGATIVES] = (() => {
   const marker = "### negatives";
