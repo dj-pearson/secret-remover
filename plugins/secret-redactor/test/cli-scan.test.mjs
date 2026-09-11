@@ -4,7 +4,7 @@ import { writeFileSync, mkdtempSync, existsSync, rmSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { makeRepo, runCli } from "./helpers/temp-repo.mjs";
+import { makeRepo, runCli, runGit } from "./helpers/temp-repo.mjs";
 
 function gitPlumbing(cwd, args, input) {
   return execFileSync("git", args, { cwd, input, encoding: "utf8" }).trim();
@@ -352,7 +352,7 @@ test("--diff-filter=d scans an added file and a type-change but excludes a delet
   execFileSync("git", ["update-index", "--cacheinfo", `100644,${secretBlob},cfg`], { cwd: dir });
   execFileSync("git", ["rm", "--cached", "-q", "gone.md"], { cwd: dir });
   writeFileSync(path.join(dir, "new.md"), "STRIPE_KEY=" + LIVE + "\n");
-  execFileSync("git", ["add", "new.md"], { cwd: dir });
+  runGit(dir, "add", "new.md");
 
   const status = gitPlumbing(dir, ["diff", "--cached", "--name-status"]);
   assert.match(status, /^T\s+cfg/m, "fixture did not produce a type-change (T)");

@@ -390,3 +390,49 @@ test("a write failure on one file does not swallow the report of another file al
     chmodSync(roPath, 0o666);
   }
 });
+
+// --- Task 10 review round 3 --------------------------------------------
+//
+// FINDING A: the byte-equality divergence check from round 2 refuses every
+// file affected by git's own EOL normalization. On a default
+// Git-for-Windows install, core.autocrlf=true (set in the machine's SYSTEM
+// gitconfig, not this repo) means `git add` writes LF to the index while
+// the worktree legitimately keeps CRLF for a file nobody hand-edited - a
+// byte comparison calls that "diverged" and fix becomes a dead end for
+// most of a user's text files. The fixture sets core.autocrlf=true
+// EXPLICITLY on this one repo (a local, not global/system, git config
+// value) so the test exercises the same behavior deterministically on any
+// machine, regardless of that machine's own ambient git config - this is
+// exactly the isolation temp-repo.mjs's isolatedGitEnv already gives every
+// other fixture in this suite, just set for a value this one test actually
+// wants turned on.
+test("fix rewrites a CRLF file under core.autocrlf=true even though the index legitimately differs from the worktree (Finding A)", () => {
+  const dir = makeRepo({});
+  runGit(dir, "config", "core.autocrlf", "true");
+  writeFileSync(path.join(dir, "cfg.txt"), "line one\r\nSTRIPE_KEY=" + LIVE + "\r\nline three\r\n");
+  runGit(dir, "add", "-A");
+
+  // Sanity-check the fixture: it must actually reproduce the autocrlf
+  // divergence, or this test proves nothing about Finding A.
+  const stagedText = execFileSync("git", ["show", ":cfg.txt"], { cwd: dir, encoding: "utf8" });
+  const worktreeText = readFileSync(path.join(dir, "cfg.txt"), "utf8");
+  assert.ok(!stagedText.includes("\r"), "staged blob must be LF-normalized under autocrlf=true, or the fixture is not exercising it");
+  assert.ok(worktreeText.includes("\r\n"), "worktree copy must keep CRLF, or the fixture is not exercising it");
+  assert.notEqual(stagedText, worktreeText, "fixture must produce a real byte-level difference between staged and worktree");
+
+  const { code, stdout } = runCli(dir, ["fix", "--staged"]);
+  assert.equal(code, 0, "an autocrlf-only difference is not a real divergence and must not be refused");
+  assert.match(stdout, /cfg\.txt/);
+  assert.match(stdout, /1 replaced/);
+  assert.equal(runCli(dir, ["scan", "--staged"]).code, 0, "the credential must actually be gone from the index, not just reported as fixed");
+});
+
+// The three real-divergence cases from Finding 2 must still refuse under
+// the new git-diff-based check, not just under the old byte comparison.
+test("fix still refuses a hand-edited file under the git-diff-based divergence check (Finding 2 case A, re-verified for Finding A)", () => {
+  const dir = makeRepo({ "a.md": "STRIPE_KEY=" + LIVE + "\n" });
+  writeFileSync(path.join(dir, "a.md"), "STRIPE_KEY=" + LIVE + "\nEDITED BY HAND AFTER STAGING\n");
+  const { code, stdout } = runCli(dir, ["fix", "--staged"]);
+  assert.equal(code, 1);
+  assert.match(stdout, /differs from the worktree/i);
+});

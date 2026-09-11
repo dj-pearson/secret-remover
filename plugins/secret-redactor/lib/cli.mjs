@@ -270,11 +270,20 @@ function scan(args) {
 //     in the index, or promoted deliberately-unstaged content into the
 //     commit unannounced. Fixed by finding hits in the STAGED blob (so a
 //     deleted-from-worktree file is still caught) and refusing to touch
-//     anything whose worktree bytes don't exactly equal its staged bytes.
-//     This is the cheap, safe half of the fix: REFUSE on divergence rather
-//     than attempt to redact the index blob directly (that needs its own
-//     task - hash-object -w plus update-index --cacheinfo, with its own
-//     review).
+//     anything that diverges from it. This is the cheap, safe half of the
+//     fix: REFUSE on divergence rather than attempt to redact the index
+//     blob directly (that needs its own task - hash-object -w plus
+//     update-index --cacheinfo, with its own review).
+//   A (review round 3) the divergence check above was originally a raw
+//     byte comparison, which refused every file affected by git's own EOL
+//     normalization - on a default Git-for-Windows install, core.autocrlf
+//     =true means most text files legitimately differ byte-for-byte
+//     between the index (LF) and the worktree (CRLF) with nobody having
+//     edited anything, so fix became a dead end for most of a user's
+//     files. Fixed by asking git the question instead: `git diff --quiet
+//     -- <rel>`, which compares post-normalization/post-filter, exactly
+//     like `git status` would. See the git() call itself for the exit-code
+//     contract.
 //   3 fix wrote THROUGH a symlink: readFileSync/writeFileSync on a tracked
 //     symlink pointing outside the repo reads and rewrites the link's
 //     TARGET, which `git show` (the index blob is just link text) never
@@ -377,22 +386,34 @@ function fix(args) {
       continue;
     }
 
-    let worktreeBuffer;
-    try {
-      worktreeBuffer = readFileSync(abs);
-    } catch (err) {
-      skipped.push(`${rel} (worktree copy could not be read: ${err.code ?? err.constructor.name})`);
+    // Finding 2, cases A and B / Finding A (review round 3): ask GIT whether
+    // the worktree and the index differ for this path, rather than compare
+    // raw bytes. A byte comparison refuses every file affected by git's own
+    // EOL normalization or a clean/smudge filter (Git LFS included) - on a
+    // default Git-for-Windows install, core.autocrlf=true means the index
+    // legitimately holds LF while the worktree legitimately holds CRLF for
+    // a file nobody has hand-edited, and a byte comparison called that
+    // "diverged" and refused nearly every text file in the repo.
+    // `git diff --quiet` answers the same question git itself would give
+    // `git status` - after normalization and filters, not before - so an
+    // autocrlf-only difference reads as "no divergence" while a real
+    // hand-edit (cases A and B) or a partial stage (case B) still reads as
+    // one. Routed through the shared git() choke-point, so it keeps
+    // gitEnv()'s hardening against a poisoned GIT_* environment.
+    //
+    // Exit code contract: 0 = no divergence, proceed. 1 = a real
+    // difference, refuse. Anything else (a spawn failure, git erroring for
+    // an unrelated reason) means git could not give a clear answer - and a
+    // command that writes files must not proceed on an unclear one, so
+    // that also refuses.
+    const diverges = git(["diff", "--quiet", "--", rel], root);
+    if (diverges.status === 1) {
+      skipped.push(`${rel}: staged content differs from the worktree - fix cannot rewrite it safely`);
       unresolved++;
       continue;
     }
-
-    // Finding 2, cases A and B: the worktree was hand-edited, or only part
-    // of it was staged. Either way the two copies disagree, and rewriting
-    // the worktree and restaging it would carry whatever it now holds -
-    // including content that was deliberately left unstaged - into the
-    // index. Refuse rather than guess which copy the user meant.
-    if (!worktreeBuffer.equals(stagedBuffer)) {
-      skipped.push(`${rel}: staged content differs from the worktree - fix cannot rewrite it safely`);
+    if (diverges.status !== 0) {
+      skipped.push(`${rel}: could not determine whether the staged content matches the worktree - fix cannot rewrite it safely`);
       unresolved++;
       continue;
     }
