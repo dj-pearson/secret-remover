@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { makeRepo, runCli } from "./helpers/temp-repo.mjs";
+import { makeRepo, runCli, runGit } from "./helpers/temp-repo.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const GITLEAKS_HOOK = readFileSync(path.join(HERE, "fixtures", "gitleaks-pre-commit"), "utf8");
@@ -78,7 +78,7 @@ test("the vendored copy actually runs and blocks", () => {
   const dir = makeRepo({ "a.md": "clean\n" });
   installInto(dir);
   writeFileSync(path.join(dir, "leak.md"), "STRIPE_KEY=" + STRIPE_SHAPED_KEY + "\n");
-  execFileSync("git", ["add", "-A"], { cwd: dir, stdio: "ignore" });
+  runGit(dir, "add", "-A");
   let status = 0;
   try {
     execFileSync(process.execPath, [path.join(dir, "scripts", "secret-gate", "cli.mjs"), "scan", "--staged"], {
@@ -157,7 +157,13 @@ test("install pins .githooks to LF in .gitattributes without dropping existing r
 
 test("install refuses to change a core.hooksPath that points elsewhere", () => {
   const dir = makeRepo({ "a.md": "clean\n" });
-  execFileSync("git", ["config", "core.hooksPath", ".myhooks"], { cwd: dir, stdio: "ignore" });
+  // A bare execFileSync here (no env) would inherit whatever GIT_* the
+  // process already carries - GIT_DIR included - and this WRITE would land
+  // in whichever repo GIT_DIR names, not `dir`. Reproduced directly: with an
+  // inherited GIT_DIR pointing at a second repo, this exact command set
+  // core.hooksPath on that OTHER repo while `dir` stayed untouched. runGit()
+  // strips every GIT_*-prefixed variable before spawning, closing that.
+  runGit(dir, "config", "core.hooksPath", ".myhooks");
   const { stdout } = installInto(dir);
   assert.match(stdout, /core\.hooksPath/);
   assert.match(stdout, /\.myhooks/);
@@ -206,7 +212,7 @@ test("Finding 1: the block still runs and blocks when the host hook would otherw
   writeFileSync(path.join(dir, ".githooks", "pre-commit"), GITLEAKS_HOOK);
   installInto(dir);
   writeFileSync(path.join(dir, "leak.md"), "STRIPE_KEY=" + STRIPE_SHAPED_KEY + "\n");
-  execFileSync("git", ["add", "-A"], { cwd: dir, stdio: "ignore" });
+  runGit(dir, "add", "-A");
   const env = { ...process.env, PATH: pathWithoutGitleaks() };
   const { status, output } = runHook(path.join(dir, ".githooks", "pre-commit"), { cwd: dir, env });
   assert.notEqual(status, 0, "the combined hook let a staged credential through with gitleaks absent:\n" + output);
@@ -237,7 +243,7 @@ test("Finding 2: a crashed scanner still warns-and-allows even when set -e prece
   // exactly the case Correction 3 says must warn and allow, never block.
   writeFileSync(path.join(dir, ".secretgate.json"), "{ not json");
   writeFileSync(path.join(dir, "clean.md"), "nothing secret here\n");
-  execFileSync("git", ["add", "-A"], { cwd: dir, stdio: "ignore" });
+  runGit(dir, "add", "-A");
   const { status, output } = runHook(path.join(dir, ".githooks", "pre-commit"), { cwd: dir });
   assert.equal(status, 0, "a broken scanner must not block a commit when set -e precedes the block:\n" + output);
 });
@@ -290,11 +296,13 @@ test("Finding 5: a lone start marker with no matching end marker is refused, not
   const after1 = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
   assert.equal(after1, broken, "install must not touch a file with an unmatched marker");
   assert.match(first.stdout, /marker/i);
+  assert.notEqual(first.code, 0, "install must exit non-zero when it refused to wire the hook up");
 
   const second = installInto(dir);
   const after2 = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
   assert.equal(after2, broken, "a second install must not touch it either");
   assert.match(second.stdout, /marker/i);
+  assert.notEqual(second.code, 0, "a second refused install must also exit non-zero");
 });
 
 // --- Finding A (Important, destructive): a duplicate start marker inside
@@ -318,10 +326,12 @@ test("Finding A: a second start marker between a real pair is refused, not splic
   assert.equal(after1, broken, "install must not delete content between a duplicate start marker and the real end marker");
   assert.match(first.stdout, /marker/i);
   assert.doesNotMatch(first.stdout, /left the rest alone/, "the note must not claim success when it refused");
+  assert.notEqual(first.code, 0, "install must exit non-zero when it refused to wire the hook up");
 
   const second = installInto(dir);
   const after2 = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
   assert.equal(after2, broken, "a second install must not touch it either");
+  assert.notEqual(second.code, 0, "a second refused install must also exit non-zero");
 });
 
 // --- Finding B (Minor): the end-marker-only refusal must be reachable. ---
@@ -332,10 +342,11 @@ test("Finding B: a lone end marker with no start marker is refused (the mirror c
   const broken = "#!/usr/bin/env sh\necho before\n# <<< secret-gate\necho after\n";
   writeFileSync(path.join(dir, ".githooks", "pre-commit"), broken);
 
-  const { stdout } = installInto(dir);
+  const { stdout, code } = installInto(dir);
   const after = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
   assert.equal(after, broken, "a lone end marker must be refused, not silently treated as no-markers-at-all");
   assert.match(stdout, /marker/i);
+  assert.notEqual(code, 0, "install must exit non-zero when it refused to wire the hook up");
 });
 
 // --- Finding C (Minor): the shebang must survive an empty file, a
@@ -371,6 +382,50 @@ test("Finding C: a BOM ahead of the host's shebang does not demote it to an iner
   const text = raw.toString("utf8");
   assert.ok(!raw.includes(Buffer.from("\uFEFF", "utf8")), "the BOM must not survive into the merged file");
   assert.match(text, /^#!\/usr\/bin\/env bash\n/, "the host's real shebang must be the file's first line, not an inert comment further down");
+  assert.match(text, /echo host-body/, "the host's own body must survive alongside the block");
+  assert.match(text, /# >>> secret-gate/);
+});
+
+// --- close-by-class follow-up to Finding C: a single `\uFEFF` strip only
+// covers ONE leading BOM. A double BOM, a leading blank line, or leading
+// spaces ahead of the shebang all reach the same `noBom.startsWith("#!")`
+// check still false, and the shebang gets demoted into the merged file's
+// body exactly the way a lone BOM used to. -------------------------------
+
+test("Finding C follow-up: a double BOM ahead of the host's shebang does not demote it", () => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+  const doubleBom = "\uFEFF\uFEFF#!/usr/bin/env bash\nset -e\necho host-body\n";
+  writeFileSync(path.join(dir, ".githooks", "pre-commit"), doubleBom);
+  installInto(dir);
+  const raw = readFileSync(path.join(dir, ".githooks", "pre-commit"));
+  const text = raw.toString("utf8");
+  assert.ok(!raw.includes(Buffer.from("\uFEFF", "utf8")), "no BOM must survive into the merged file");
+  assert.match(text, /^#!\/usr\/bin\/env bash\n/, "the host's real shebang must be the file's first line");
+  assert.match(text, /echo host-body/, "the host's own body must survive alongside the block");
+  assert.match(text, /# >>> secret-gate/);
+});
+
+test("Finding C follow-up: a leading blank line ahead of the host's shebang does not demote it", () => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+  const leadingBlank = "\n#!/usr/bin/env bash\nset -e\necho host-body\n";
+  writeFileSync(path.join(dir, ".githooks", "pre-commit"), leadingBlank);
+  installInto(dir);
+  const text = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
+  assert.match(text, /^#!\/usr\/bin\/env bash\n/, "the host's real shebang must be the file's first line");
+  assert.match(text, /echo host-body/, "the host's own body must survive alongside the block");
+  assert.match(text, /# >>> secret-gate/);
+});
+
+test("Finding C follow-up: leading spaces ahead of the host's shebang do not demote it", () => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+  const leadingSpaces = "   #!/usr/bin/env bash\nset -e\necho host-body\n";
+  writeFileSync(path.join(dir, ".githooks", "pre-commit"), leadingSpaces);
+  installInto(dir);
+  const text = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
+  assert.match(text, /^#!\/usr\/bin\/env bash\n/, "the host's real shebang must be the file's first line");
   assert.match(text, /echo host-body/, "the host's own body must survive alongside the block");
   assert.match(text, /# >>> secret-gate/);
 });

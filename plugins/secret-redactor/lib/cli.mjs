@@ -617,16 +617,20 @@ function writeLf(file, contents) {
 //     itself `exit` before reaching end-of-file - gitleaks's own hook exits
 //     0 when gitleaks is not installed, which is the ordinary case, not an
 //     edge case. A block appended at EOF would then simply never run.
-//     Running first means nothing later in the file can ever skip it. A
-//     leading BOM is stripped before this check (review Finding C): `\s`
-//     (used by the leading-whitespace trim further down) matches U+FEFF,
-//     so a BOM ahead of `#!` used to be swallowed together with the
-//     shebang line itself, demoting the host's real interpreter directive
-//     to an inert comment partway through the file. Stripping it first
-//     means the real shebang is found and the block still lands right
-//     after it.
+//     Running first means nothing later in the file can ever skip it. Any
+//     leading whitespace or BOM is stripped before this check (review
+//     Finding C, then its follow-up): a single `existing.startsWith("\uFEFF")
+//     ? existing.slice(1) : existing` only ever stripped ONE leading BOM -
+//     a double BOM, a leading blank line, or leading spaces ahead of the
+//     shebang all left `noBom.startsWith("#!")` false just the same,
+//     demoting the host's real interpreter directive into the merged
+//     file's body instead of its first line. `replace(/^[\s\uFEFF]+/, "")`
+//     strips any run of whitespace and/or BOM characters in one pass
+//     regardless of count or shape, closing the class rather than the one
+//     named case: the real shebang is found and the block still lands
+//     right after it.
 function spliceHook(existing, block, full) {
-  const noBom = existing.startsWith("\uFEFF") ? existing.slice(1) : existing;
+  const noBom = existing.replace(/^[\s\uFEFF]+/, "");
   if (noBom.trim() === "") {
     return { ok: true, text: full };
   }
@@ -707,6 +711,12 @@ function install(args) {
   const full = template("pre-commit");
   const block = full.slice(full.indexOf(MARK_START));
   let hookWritten = false;
+  // Set when spliceHook refuses rather than guessing (a malformed marker
+  // pair) - install must not report success on stdout AND exit 0 on that
+  // path. A scripted rollout across nineteen repos reads exit 0 as "the
+  // gate is wired," and the refusal note is loud on stdout but invisible to
+  // a script that only checks the exit code.
+  let refused = false;
   if (existsSync(hookFile)) {
     const spliced = spliceHook(readFileSync(hookFile, "utf8"), block, full);
     if (spliced.ok) {
@@ -715,6 +725,7 @@ function install(args) {
       hookWritten = true;
     } else {
       notes.push(`REFUSED to touch .githooks/pre-commit: ${spliced.error}`);
+      refused = true;
     }
   } else {
     writeLf(hookFile, full);
@@ -807,7 +818,11 @@ function install(args) {
       "",
     ].join("\n"),
   );
-  return 0;
+  // Non-zero when install REFUSED to wire the hook up, even though every
+  // other step above still ran and every note is on stdout: a script that
+  // only checks the exit code (this plugin's own rollout across nineteen
+  // repos included) must not read a refusal as success.
+  return refused ? 1 : 0;
 }
 
 // --- entry point -------------------------------------------------------
