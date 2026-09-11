@@ -103,8 +103,19 @@ function nearestExistingAncestor(dir) {
 // deny. Timing the child out ourselves turns that into a fast, honest
 // "git could not answer" instead.
 export function gitIgnores(filePath, cwd) {
+  // Both the cwd git is asked FROM and the path it is asked ABOUT are
+  // canonicalized, and they have to move together: git resolves its own
+  // working directory through realpath before deciding whether a pathspec is
+  // inside the repository, so handing it a canonical cwd and a symlinked
+  // (or 8.3-short, or differently-cased) argument invites an "outside
+  // repository" error - which lands on available:false, and available:false
+  // is what lets envExemption fall back to the .env NAME rule and exempt a
+  // tracked file. Only the parent is canonicalized on the argument: git
+  // tracks a symlink as a symlink, and resolving the final component would
+  // ask about the link's target instead of the path in question.
   const dir = canonicalize(path.isAbsolute(filePath) ? nearestExistingAncestor(path.dirname(filePath)) : cwd);
-  const result = spawnSync("git", ["check-ignore", "--quiet", "--", filePath], {
+  const target = path.isAbsolute(filePath) ? canonicalizeParent(filePath) : filePath;
+  const result = spawnSync("git", ["check-ignore", "--quiet", "--", target], {
     cwd: dir,
     timeout: GIT_TIMEOUT_MS,
     stdio: "ignore",
