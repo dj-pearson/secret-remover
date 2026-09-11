@@ -1,4 +1,4 @@
-# secret-redactor
+# secret-remover
 
 Keeps plaintext credentials out of Claude Code transcripts, out of files, and
 out of GitHub - for the credential shapes it recognizes; see Known
@@ -32,17 +32,21 @@ git will carry, blocking is the safer default, not redacting on the sly.
 
 ## Install
 
-Three names are involved, and each belongs to a different command:
+One name covers the repo, the marketplace and this plugin. There is a second
+name you type afterwards:
 
-| Name | What it is | Command that uses it |
+| Name | What it is | Where you use it |
 |---|---|---|
-| `claude-secret-remover` | the GitHub repo | `claude plugin marketplace add dj-pearson/claude-secret-remover` |
-| `pearson-media` | the marketplace (`.claude-plugin/marketplace.json`) | `claude plugin marketplace update pearson-media` |
-| `secret-redactor` | this plugin | `claude plugin install secret-redactor` |
+| `secret-remover` | the repo, the marketplace and this plugin - all three | `claude plugin marketplace add dj-pearson/secret-remover` then `claude plugin install secret-remover` |
+| `secret-gate` | the commit gate this plugin installs into a repo | `/secret-gate install`, `scripts/secret-gate/`, `.secretgate.json` |
+
+`secret-gate` is a separate name on purpose: it is vendored into the repo and
+keeps working in a clone that has never had this plugin, or Claude Code,
+installed at all.
 
 ```bash
-claude plugin marketplace add dj-pearson/claude-secret-remover
-claude plugin install secret-redactor
+claude plugin marketplace add dj-pearson/secret-remover
+claude plugin install secret-remover
 ```
 
 Then, in a repo you want the commit gate wired into:
@@ -214,11 +218,11 @@ build is the right response to "the scanner couldn't check something."
 Four places have to move together, not three - `test/version.test.mjs`
 asserts all four are equal and fails the build if they drift:
 
-- `plugins/secret-redactor/package.json` (`version`)
-- `plugins/secret-redactor/.claude-plugin/plugin.json` (`version`)
-- the `secret-redactor` entry in the root `.claude-plugin/marketplace.json`
+- `plugins/secret-remover/package.json` (`version`)
+- `plugins/secret-remover/.claude-plugin/plugin.json` (`version`)
+- the `secret-remover` entry in the root `.claude-plugin/marketplace.json`
   (`version`)
-- `VERSION` in `plugins/secret-redactor/lib/cli.mjs`
+- `VERSION` in `plugins/secret-remover/lib/cli.mjs`
 
 That fourth one matters beyond keeping a number consistent: `install` stamps
 it into every repo it vendors into, so a mismatch there means a vendored

@@ -26,13 +26,13 @@ const plural = total === 1 ? "secret" : "secrets";
 
 writeResult({
   systemMessage:
-    `secret-redactor: ${total} ${plural} redacted from your prompt. ` +
+    `secret-remover: ${total} ${plural} redacted from your prompt. ` +
     `Add ${ESCAPE} to the prompt if you meant to send it.`,
   hookSpecificOutput: {
     hookEventName: "UserPromptSubmit",
     updatedPrompt,
     additionalContext:
-      `secret-redactor replaced ${total} ${plural} in the user's prompt (${summarize(state.hits)}). ` +
+      `secret-remover replaced ${total} ${plural} in the user's prompt (${summarize(state.hits)}). ` +
       `Each one appears as [REDACTED <kind> #n]. The real values were never sent to you, ` +
       `so do not guess them or ask the user to paste them again. Read them at run time ` +
       `from the environment instead.`,

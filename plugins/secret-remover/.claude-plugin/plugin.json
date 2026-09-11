@@ -1,9 +1,12 @@
 {
-  "name": "secret-redactor",
-  "version": "2.1.0",
+  "name": "secret-remover",
+  "version": "2.2.0",
   "description": "Keeps plaintext credentials out of transcripts, out of files, and out of GitHub.",
   "author": {
     "name": "Pearson Media LLC"
   },
+  "homepage": "https://github.com/dj-pearson/secret-remover/tree/main/plugins/secret-remover",
+  "repository": "https://github.com/dj-pearson/secret-remover",
+  "license": "MIT",
   "keywords": ["security", "secrets", "redaction", "hooks", "pre-commit"]
 }

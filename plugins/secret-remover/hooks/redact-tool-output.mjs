@@ -19,12 +19,12 @@ const tool = input.tool_name || "tool";
 const plural = total === 1 ? "secret" : "secrets";
 
 writeResult({
-  systemMessage: `secret-redactor: ${total} ${plural} redacted from ${tool} output`,
+  systemMessage: `secret-remover: ${total} ${plural} redacted from ${tool} output`,
   hookSpecificOutput: {
     hookEventName: "PostToolUse",
     updatedToolOutput: value,
     additionalContext:
-      `secret-redactor replaced ${total} ${plural} in this ${tool} result (${summarize(hits)}). ` +
+      `secret-remover replaced ${total} ${plural} in this ${tool} result (${summarize(hits)}). ` +
       `Each one appears as [REDACTED <kind> #n]; the same number means the same value. ` +
       `The real values were never sent to you, so do not guess them or try to reconstruct them. ` +
       `If you need one, read it at run time from the environment or ask the user.`,

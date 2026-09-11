@@ -24,7 +24,7 @@ import { loadAllowlist, isAllowed, staleEntries, ALLOWLIST_FILE } from "./allowl
 import { gitEnv } from "./gitignore.mjs";
 import { canonicalize, canonicalizeParent, isSameFile } from "./paths.mjs";
 
-export const VERSION = "2.1.0";
+export const VERSION = "2.2.0";
 
 const USAGE = `usage: secret-gate <command>
 
