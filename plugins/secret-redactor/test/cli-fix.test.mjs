@@ -160,8 +160,20 @@ test("a malformed .secretgate.json makes fix exit 2 and rewrite nothing", () => 
 // decoded strings, so a re-encoding difference (e.g. the BOM being dropped
 // or CRLF being normalized to LF) would fail this test even if it "reads"
 // the same.
-test("fix preserves a BOM, CRLF line endings and a missing trailing newline exactly", () => {
+//
+// core.autocrlf=true is set EXPLICITLY on this fixture (Finding B, review
+// round 4): without it, the staged blob and the worktree file are
+// byte-identical from the moment they're staged, and this test would still
+// pass even if fix wrote the STAGED (not worktree) text back out - which is
+// exactly the bug Finding B found. With autocrlf on, `git add` normalizes
+// this file's CRLFs to LF going into the index while the worktree keeps
+// CRLF, so a fix that spliced staged offsets into (or wrote staged text
+// over) the worktree file would silently convert every line ending in the
+// file to LF, not just redact the finding - this assertion is the one that
+// catches that.
+test("fix preserves a BOM, CRLF line endings and a missing trailing newline exactly, even when core.autocrlf normalizes the staged copy (Finding B)", () => {
   const dir = makeRepo({});
+  runGit(dir, "config", "core.autocrlf", "true");
   // Built with String.fromCharCode rather than an embedded literal - the
   // UTF-8 BOM character (U+FEFF) is the deliberate subject of this test,
   // not incidental source content, and it must not sit invisibly in this
@@ -171,12 +183,21 @@ test("fix preserves a BOM, CRLF line endings and a missing trailing newline exac
   writeFileSync(path.join(dir, "notes.txt"), before);
   runGit(dir, "add", "-A");
 
+  // Sanity-check the fixture: it must actually reproduce the autocrlf
+  // normalization, or this test proves nothing about Finding B.
+  const stagedText = execFileSync("git", ["show", ":notes.txt"], { cwd: dir, encoding: "utf8" });
+  assert.ok(!stagedText.includes("\r"), "staged blob must be LF-normalized under autocrlf=true, or the fixture is not exercising Finding B");
+
   const { code } = runCli(dir, ["fix", "--staged"]);
   assert.equal(code, 0);
 
   const after = readFileSync(path.join(dir, "notes.txt"));
   const expected = Buffer.from(bom + "line one\r\nSTRIPE_KEY=[REDACTED stripe-key #1]\r\nlast line, no newline", "utf8");
-  assert.ok(after.equals(expected), "bytes outside the redacted range must be byte-identical, including the BOM, CRLF and the missing trailing newline");
+  assert.ok(
+    after.equals(expected),
+    "bytes outside the redacted range must be byte-identical, including the BOM, CRLF and the missing trailing newline - not silently reformatted to the index's LF-normalized form",
+  );
+  assert.equal(runCli(dir, ["scan", "--staged"]).code, 0, "the credential must actually be gone from the index");
 });
 
 // A hit at byte offset 0 - the very first bytes of the file - exercises the

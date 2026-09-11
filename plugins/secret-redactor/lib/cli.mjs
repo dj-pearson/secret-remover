@@ -284,6 +284,20 @@ function scan(args) {
 //     -- <rel>`, which compares post-normalization/post-filter, exactly
 //     like `git status` would. See the git() call itself for the exit-code
 //     contract.
+//   B (review round 4) once Finding A stopped treating an autocrlf-only
+//     difference as divergence, fix still wrote a redaction of the STAGED
+//     text back to the WORKTREE path - so a 3-line CRLF file with a
+//     finding on one line came back with ALL THREE lines silently
+//     reformatted to LF (the index's normalized form), not just the line
+//     with the finding. Not data loss, but a broken promise (round 1's own
+//     "everything outside the hit is byte-identical" guarantee). Fixed by
+//     re-running findSecrets against the WORKTREE text and splicing into
+//     THAT, rather than mapping staged offsets onto worktree bytes - the
+//     decision to act still comes from the staged copy (Critical 2 is
+//     unchanged), only the text that gets redacted and written does not.
+//     If the two copies somehow yield a different number of hits despite
+//     `git diff --quiet` calling them equivalent, fix refuses rather than
+//     guess which count is right.
 //   3 fix wrote THROUGH a symlink: readFileSync/writeFileSync on a tracked
 //     symlink pointing outside the repo reads and rewrites the link's
 //     TARGET, which `git show` (the index blob is just link text) never
@@ -418,8 +432,60 @@ function fix(args) {
       continue;
     }
 
+    // Finding B (review round 4): splice into the WORKTREE's own text, not
+    // the staged text. `git diff --quiet` just confirmed the two copies are
+    // equivalent in git's terms, so the same secrets are present in both -
+    // they simply sit at different byte offsets whenever core.autocrlf, a
+    // .gitattributes normalization rule, or a clean/smudge filter is in
+    // play (which is the ordinary case on Windows, not an edge case).
+    // Splicing the STAGED offsets into the WORKTREE text - or writing the
+    // staged text back to the worktree path at all - silently reformats
+    // every line in the file to match the index's line endings, not just
+    // the ones with a finding. Finding the hits again directly in the
+    // worktree text sidesteps offset-translation entirely and cannot drift.
+    //
+    // The decision that there is something to fix, and the divergence
+    // refusal above, still come from the STAGED copy (hits, stagedBuffer,
+    // stagedText) - only the text that gets redacted and written changes.
+    let worktreeBuffer;
+    try {
+      worktreeBuffer = readFileSync(abs);
+    } catch (err) {
+      skipped.push(`${rel} (worktree copy could not be read: ${err.code ?? err.constructor.name})`);
+      unresolved++;
+      continue;
+    }
+    const worktreeText = worktreeBuffer.toString("utf8");
+
+    // Finding 1's guarantee, carried over to whichever buffer is actually
+    // written: since the write target changed from the staged buffer to
+    // the worktree buffer, the round-trip check has to move with it, or a
+    // worktree copy produced by an encoding-changing filter could be
+    // corrupted exactly the way Finding 1 already fixed once.
+    if (!Buffer.from(worktreeText, "utf8").equals(worktreeBuffer)) {
+      skipped.push(`${rel} (worktree copy is not valid UTF-8 - rewriting it would corrupt bytes outside the finding, left as-is)`);
+      unresolved++;
+      continue;
+    }
+
+    const worktreeHits = findSecrets(worktreeText).filter((hit) => !isAllowed(allowlist, rel, hit));
+
+    // git diff --quiet said the staged and worktree copies are equivalent,
+    // so they should carry the same number of unresolved findings. If they
+    // don't - a filter that changes content in a way `git diff` doesn't
+    // consider a difference, or anything else this file didn't anticipate
+    // - refuse rather than guess which count is right. A command that
+    // writes files does not proceed on an inconsistency it cannot explain.
+    if (worktreeHits.length !== hits.length) {
+      skipped.push(
+        `${rel}: found ${hits.length} finding(s) in the staged copy but ${worktreeHits.length} in the worktree copy - fix cannot rewrite it safely`,
+      );
+      unresolved++;
+      continue;
+    }
+
     const state = newState();
-    const rewritten = redactRanges(stagedText, hits, state);
+    const rewritten = redactRanges(worktreeText, worktreeHits, state);
 
     // Finding 6: a write or restage failure demotes this file to a skip
     // instead of throwing out of the loop, so files handled earlier (or
@@ -436,8 +502,8 @@ function fix(args) {
       continue;
     }
 
-    lines.push(`  ${rel}: ${hits.length} replaced (${[...new Set(hits.map((h) => h.label))].join(", ")})`);
-    total += hits.length;
+    lines.push(`  ${rel}: ${worktreeHits.length} replaced (${[...new Set(worktreeHits.map((h) => h.label))].join(", ")})`);
+    total += worktreeHits.length;
   }
 
   // Finding 5: report skips the way scan's report() does, not silently.
