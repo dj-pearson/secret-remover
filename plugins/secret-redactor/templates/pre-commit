@@ -6,9 +6,37 @@
 # Any other non-zero exit means the scanner itself broke. That warns and lets
 # the commit through on purpose: a crashing scanner must not brick committing.
 # The CI job runs the same scan and does treat that as a failure.
+#
+# This block is spliced in right after the shebang line, not appended at the
+# end of the file, on purpose: a host hook this is merged into (gitleaks's,
+# say) may itself `exit 0` early - gitleaks does exactly that when it is not
+# installed, which is the documented, expected state for anyone who has not
+# run `brew install gitleaks`. A block appended at end-of-file would simply
+# never run in that repo. Running first means no later `exit` in the rest of
+# the file can ever skip this scan.
+#
+# What "exit 2 means broken, warn and allow" CANNOT cover: it only sees
+# statuses main()'s own try/catch produces. A missing or syntactically broken
+# vendored file - e.g. a relative import this copy no longer has - fails
+# before main() ever runs, as a Node module-resolution or syntax error, and
+# Node exits 1 for that: identical to "findings were found." This hook
+# cannot tell the two apart, which is exactly why the vendored file set is
+# derived from the real import graph by a test (VENDORED_FILES / the
+# closure test in cli-install.test.mjs) instead of trusted to stay right by
+# hand - a wrong vendored set does not degrade to a warning here, it wedges
+# every future commit.
+__secret_gate_status=0
 if command -v node >/dev/null 2>&1; then
-  node "$(git rev-parse --show-toplevel)/scripts/secret-gate/cli.mjs" scan --staged
-  __secret_gate_status=$?
+  # `|| __secret_gate_status=$?`, not `node ...; __secret_gate_status=$?` on
+  # two lines: this block may run inside a host hook (or a future edit to
+  # this one) under `set -e`. Under `set -e`, a bare non-zero command aborts
+  # the shell on the spot, before a following line ever reads $? - which
+  # would turn a crashed scanner (exit 2, meant to warn-and-allow) into an
+  # aborted script that still exits non-zero, blocking a commit for exactly
+  # the reason this hook exists to not block on. Folding the status capture
+  # into the same statement as the command keeps `set -e` from ever seeing
+  # a bare failure here.
+  node "$(git rev-parse --show-toplevel)/scripts/secret-gate/cli.mjs" scan --staged || __secret_gate_status=$?
   if [ "$__secret_gate_status" -eq 1 ]; then
     exit 1
   fi

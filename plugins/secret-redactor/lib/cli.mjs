@@ -544,7 +544,16 @@ export const VENDORED_FILES = ["detect.mjs", "allowlist.mjs", "gitignore.mjs", "
 
 const MARK_START = "# >>> secret-gate";
 const MARK_END = "# <<< secret-gate";
+// Used for every filesystem call - path.join gives the OS-native separator,
+// which is what mkdirSync/copyFileSync/etc. need.
 const VENDOR_DIR = path.join("scripts", "secret-gate");
+// Used ONLY in the human-facing "run this" text printed at the end of
+// install(). A `path.join`-built string is "scripts\secret-gate" on
+// Windows, and a copy-pasted `git add scripts\secret-gate` fails under
+// bash/sh - the backslash is an escape character there, not a separator.
+// git itself accepts forward slashes on every platform, so the printed
+// hint always uses them regardless of which OS produced it.
+const VENDOR_DIR_POSIX = "scripts/secret-gate";
 const LF_RULE = ".githooks/** text eol=lf";
 
 function here() {
@@ -566,18 +575,64 @@ function writeLf(file, contents) {
   writeFileSync(file, contents.replaceAll("\r\n", "\n"), { encoding: "utf8" });
 }
 
+// Splices `block` into `existing`, or says why it refuses to.
+//
+// Three cases:
+//   - both markers present, end after start: replace exactly that span.
+//     `end` is searched for FROM `start`'s index, not from 0 - searching
+//     from 0 is what let a lone start marker with leftover user content
+//     below it get treated as "found a pair" against a LATER end marker
+//     that this function itself had appended on a previous run, deleting
+//     everything in between (review Finding 5).
+//   - exactly one marker present: a hand-edited or corrupted block. Refuse
+//     rather than guess which half is missing - a wrong guess here can
+//     delete the rest of the file's content, permanently, the first time
+//     someone re-runs install.
+//   - no markers at all: insert right after the shebang line, not at
+//     end-of-file (review Finding 1). A host hook this is merged into may
+//     itself `exit` before reaching end-of-file - gitleaks's own hook exits
+//     0 when gitleaks is not installed, which is the ordinary case, not an
+//     edge case. A block appended at EOF would then simply never run.
+//     Running first means nothing later in the file can ever skip it.
 function spliceHook(existing, block) {
   const start = existing.indexOf(MARK_START);
-  const end = existing.indexOf(MARK_END);
+  const end = start === -1 ? -1 : existing.indexOf(MARK_END, start);
   if (start !== -1 && end !== -1 && end > start) {
-    return existing.slice(0, start) + block.trim() + existing.slice(end + MARK_END.length);
+    return { ok: true, text: existing.slice(0, start) + block.trim() + existing.slice(end + MARK_END.length) };
   }
-  return existing.replace(/\s*$/, "") + "\n\n" + block.trim() + "\n";
+  if (start !== -1 || end !== -1) {
+    const which = start !== -1 ? MARK_START : MARK_END;
+    return {
+      ok: false,
+      error:
+        `found '${which}' but not its matching marker - refusing to touch .githooks/pre-commit. ` +
+        "Remove the stray marker line (or restore its pair) by hand, then re-run install.",
+    };
+  }
+  const shebangEnd = existing.startsWith("#!") ? existing.indexOf("\n") : -1;
+  if (shebangEnd === -1) {
+    return { ok: true, text: block.trim() + "\n\n" + existing.replace(/^\s+/, "") };
+  }
+  return {
+    ok: true,
+    text: existing.slice(0, shebangEnd + 1) + "\n" + block.trim() + "\n\n" + existing.slice(shebangEnd + 1).replace(/^\s+/, ""),
+  };
 }
 
 function stampOf(text) {
   const match = text.match(/secret-gate (\d+\.\d+\.\d+)/);
   return match ? match[1] : null;
+}
+
+// Numeric x.y.z compare: -1 if a < b, 0 if equal, 1 if a > b. String
+// comparison would put "10.0.0" before "9.0.0"; this doesn't.
+function compareVersions(a, b) {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  }
+  return 0;
 }
 
 function install(args) {
@@ -607,27 +662,72 @@ function install(args) {
   const hookFile = path.join(root, ".githooks", "pre-commit");
   const full = template("pre-commit");
   const block = full.slice(full.indexOf(MARK_START));
+  let hookWritten = false;
   if (existsSync(hookFile)) {
-    writeLf(hookFile, spliceHook(readFileSync(hookFile, "utf8"), block));
-    notes.push("updated the secret-gate block in .githooks/pre-commit, left the rest alone");
+    const spliced = spliceHook(readFileSync(hookFile, "utf8"), block);
+    if (spliced.ok) {
+      writeLf(hookFile, spliced.text);
+      notes.push("updated the secret-gate block in .githooks/pre-commit, left the rest alone");
+      hookWritten = true;
+    } else {
+      notes.push(`REFUSED to touch .githooks/pre-commit: ${spliced.error}`);
+    }
   } else {
     writeLf(hookFile, full);
     notes.push("wrote .githooks/pre-commit");
+    hookWritten = true;
   }
-  try {
-    chmodSync(hookFile, 0o755);
-  } catch {
-    // Windows has no exec bit. git handles it on checkout.
+  if (hookWritten) {
+    try {
+      chmodSync(hookFile, 0o755);
+    } catch {
+      // Windows has no exec bit; the update-index call below is what
+      // actually matters there.
+    }
+    // A Windows working tree has no exec bit at all, so chmodSync above is a
+    // no-op on the one platform where core.hooksPath most needs it spelled
+    // out for git. The MODE lives in the INDEX, not the filesystem - `git
+    // add` alone on Windows stages this file as 100644, and POSIX git
+    // (Linux, macOS, every CI runner) refuses to run a non-executable hook.
+    // Anyone who clones a repo installed from a Windows machine would get no
+    // gate at all, silently. `--chmod=+x` sets the mode git actually looks
+    // at, regardless of what the filesystem believes; `--add` is required
+    // the first time the path is not tracked yet.
+    const staged = git(["update-index", "--add", "--chmod=+x", ".githooks/pre-commit"], root);
+    if (staged.status === 0) {
+      notes.push("staged .githooks/pre-commit as executable (100755) in the index");
+    } else {
+      notes.push(
+        "COULD NOT mark .githooks/pre-commit executable in the index - " +
+          "run: git update-index --add --chmod=+x .githooks/pre-commit",
+      );
+    }
   }
 
-  // 4. CI workflow, rewritten only when its stamp is older
+  // 4. CI workflow. Rewritten when missing, or --force, or when it carries
+  // an OLDER secret-gate version stamp than this one - never merely a
+  // DIFFERENT one. A file with no stamp at all is someone's own
+  // hand-written workflow and is left alone the same way .secretgate.json
+  // is; a file stamped NEWER than this install (this machine's plugin is
+  // behind, not the repo's file) is left alone too, rather than downgraded.
   const wfFile = path.join(root, ".github", "workflows", "secret-gate.yml");
   const wf = template("workflow.yml");
-  if (!existsSync(wfFile) || force || stampOf(readFileSync(wfFile, "utf8")) !== VERSION) {
+  if (!existsSync(wfFile)) {
     writeLf(wfFile, wf);
     notes.push("wrote .github/workflows/secret-gate.yml");
+  } else if (force) {
+    writeLf(wfFile, wf);
+    notes.push("wrote .github/workflows/secret-gate.yml (--force)");
   } else {
-    notes.push("workflow already at " + VERSION);
+    const existingStamp = stampOf(readFileSync(wfFile, "utf8"));
+    if (existingStamp === null) {
+      notes.push("kept your existing .github/workflows/secret-gate.yml (no secret-gate version stamp found)");
+    } else if (compareVersions(existingStamp, VERSION) < 0) {
+      writeLf(wfFile, wf);
+      notes.push(`updated .github/workflows/secret-gate.yml from ${existingStamp} to ${VERSION}`);
+    } else {
+      notes.push(`workflow already at ${existingStamp} (>= ${VERSION}), left alone`);
+    }
   }
 
   // 5. LF pin. A CRLF shebang breaks git-for-windows sh.
@@ -657,7 +757,7 @@ function install(args) {
       ...notes.map((n) => "  " + n),
       "",
       "Commit the new files so the gate travels with the repo:",
-      `  git add ${VENDOR_DIR} ${ALLOWLIST_FILE} .githooks .github/workflows/secret-gate.yml .gitattributes`,
+      `  git add ${VENDOR_DIR_POSIX} ${ALLOWLIST_FILE} .githooks .github/workflows/secret-gate.yml .gitattributes`,
       "",
       "On another clone of this repo, run:  git config core.hooksPath .githooks",
       "",

@@ -5,7 +5,7 @@
 // three files Task 11's `install` vendors into every consuming repo. An
 // ASCII scan (`rg '[^\x00-\x7F]'`) cannot catch this: NUL is below 0x7F, not
 // above it. This guard closes the class rather than the two named files, so
-// it cannot come back anywhere under lib/, hooks/, bin/ or test/.
+// it cannot come back anywhere under lib/, hooks/, bin/, test/ or templates/.
 //
 // Deliberately not spelling that escape sequence out in this comment: doing
 // exactly that is how Finding A happened in the first place (see the task
@@ -19,7 +19,12 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const PLUGIN = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const GUARDED_DIRS = ["lib", "hooks", "bin", "test"];
+// templates/ is guarded too (Task 11 review, Finding 7's smaller sibling):
+// those files are exactly the ones `install` writes into other people's
+// repos, so a control byte there is not "our problem", it is everyone's
+// problem the moment they run install. Clean today; nothing but this test
+// keeps it that way.
+const GUARDED_DIRS = ["lib", "hooks", "bin", "test", "templates"];
 
 function walk(dir) {
   const out = [];
@@ -31,7 +36,7 @@ function walk(dir) {
   return out;
 }
 
-test("no file under lib/, hooks/, bin/ or test/ contains a raw byte below 0x09", () => {
+test("no file under lib/, hooks/, bin/, test/ or templates/ contains a raw byte below 0x09", () => {
   const offenders = [];
   for (const dirName of GUARDED_DIRS) {
     for (const file of walk(path.join(PLUGIN, dirName))) {
