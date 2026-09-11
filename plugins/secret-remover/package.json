@@ -4,10 +4,10 @@
   "type": "module",
   "description": "Claude Code hooks plus a commit gate that keep plaintext credentials out of transcripts and out of GitHub.",
   "license": "MIT",
-  "homepage": "https://github.com/dj-pearson/claude-secret-remover/tree/main/plugins/secret-remover",
+  "homepage": "https://github.com/dj-pearson/secret-remover/tree/main/plugins/secret-remover",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dj-pearson/claude-secret-remover.git"
+    "url": "git+https://github.com/dj-pearson/secret-remover.git"
   },
   "engines": {
     "node": ">=22"

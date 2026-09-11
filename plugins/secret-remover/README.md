@@ -32,12 +32,12 @@ git will carry, blocking is the safer default, not redacting on the sly.
 
 ## Install
 
-Two identifiers are involved, plus one you type afterwards:
+One name covers the repo, the marketplace and this plugin. There is a second
+name you type afterwards:
 
 | Name | What it is | Where you use it |
 |---|---|---|
-| `claude-secret-remover` | the GitHub repo | `claude plugin marketplace add dj-pearson/claude-secret-remover` |
-| `secret-remover` | both the marketplace and this plugin | `claude plugin install secret-remover` |
+| `secret-remover` | the repo, the marketplace and this plugin - all three | `claude plugin marketplace add dj-pearson/secret-remover` then `claude plugin install secret-remover` |
 | `secret-gate` | the commit gate this plugin installs into a repo | `/secret-gate install`, `scripts/secret-gate/`, `.secretgate.json` |
 
 `secret-gate` is a separate name on purpose: it is vendored into the repo and
@@ -45,7 +45,7 @@ keeps working in a clone that has never had this plugin, or Claude Code,
 installed at all.
 
 ```bash
-claude plugin marketplace add dj-pearson/claude-secret-remover
+claude plugin marketplace add dj-pearson/secret-remover
 claude plugin install secret-remover
 ```
 

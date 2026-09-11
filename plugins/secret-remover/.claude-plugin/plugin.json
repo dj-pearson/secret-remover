@@ -5,8 +5,8 @@
   "author": {
     "name": "Pearson Media LLC"
   },
-  "homepage": "https://github.com/dj-pearson/claude-secret-remover/tree/main/plugins/secret-remover",
-  "repository": "https://github.com/dj-pearson/claude-secret-remover",
+  "homepage": "https://github.com/dj-pearson/secret-remover/tree/main/plugins/secret-remover",
+  "repository": "https://github.com/dj-pearson/secret-remover",
   "license": "MIT",
   "keywords": ["security", "secrets", "redaction", "hooks", "pre-commit"]
 }
