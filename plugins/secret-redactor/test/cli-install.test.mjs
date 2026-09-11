@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, mkdtempSync, symlinkSync, rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { makeRepo, runCli, runGit, isolatedGitEnv } from "./helpers/temp-repo.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -40,12 +41,35 @@ function pathWithoutGitleaks() {
 // Runs a hook file with `sh`, the same interpreter git itself uses to run a
 // `.githooks/pre-commit` script on this platform, and normalizes the
 // exit-code/output shape whether it succeeds or throws.
-function runHook(hookFile, { cwd, env } = {}) {
+//
+// `shell` exists because "sh" is not one interpreter across this matrix: it
+// is dash on Ubuntu, bash-in-POSIX-mode on macOS, and busybox-ish under Git
+// for Windows. A fixture that needs a bash-only feature (`set -o pipefail`)
+// has to say bash and be skipped where bash is absent, rather than being run
+// under a shell that rejects the feature on line 2 and never reaches the code
+// under test - which is precisely how the `set -euo pipefail` fixture below
+// used to "pass" on macOS and fail on Ubuntu for a reason that had nothing to
+// do with this plugin.
+function runHook(hookFile, { cwd, env, shell = "sh" } = {}) {
   try {
-    const stdout = execFileSync("sh", [hookFile], { cwd, env: env ?? process.env, encoding: "utf8" });
+    const stdout = execFileSync(shell, [hookFile], { cwd, env: env ?? process.env, encoding: "utf8" });
     return { status: 0, output: stdout };
   } catch (err) {
     return { status: err.status ?? 1, output: (err.stdout ?? "") + (err.stderr ?? "") };
+  }
+}
+
+// True when `bash` is on PATH and runnable. Git for Windows ships one, macOS
+// and every Linux runner have one, but nothing here may ASSUME one: a test
+// that silently turns into a no-op is better than a suite that cannot run at
+// all on a machine without bash, as long as the POSIX half of the same
+// contract is still asserted unconditionally (it is, in the test above).
+function hasBash() {
+  try {
+    execFileSync("bash", ["-c", "exit 0"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -63,6 +87,7 @@ test("install writes the vendored library, config, hook and workflow into an emp
     "scripts/secret-gate/detect.mjs",
     "scripts/secret-gate/allowlist.mjs",
     "scripts/secret-gate/gitignore.mjs",
+    "scripts/secret-gate/paths.mjs",
     "scripts/secret-gate/cli.mjs",
     "scripts/secret-gate/VERSION",
     ".secretgate.json",
@@ -89,6 +114,79 @@ test("the vendored copy actually runs and blocks", () => {
     status = err.status;
   }
   assert.equal(status, 1);
+});
+
+// The macOS leg of CI failed "the vendored copy actually runs and blocks"
+// above for a reason that had nothing to do with macOS and everything to do
+// with symlinks: os.tmpdir() there is under /var, which is a symlink to
+// /private/var, so `node /var/.../cli.mjs` got an import.meta.url of
+// file:///private/var/.../cli.mjs. cli.mjs's entry-point check compared those
+// two spellings verbatim, decided it had been imported rather than invoked,
+// never called main(), and exited 0 on a staged live credential. Same class
+// on Windows via 8.3 short paths, and on any machine whose checkout sits
+// under a symlinked home or an automounted share.
+//
+// The test above only catches that where the platform's temp dir happens to
+// be symlinked. This one constructs the symlink itself, so the regression is
+// pinned on every platform rather than on one leg of the matrix.
+// Returns { link, cleanup } or null when this machine will not let the test
+// create a symlink at all. Callers that get null call t.skip() rather than
+// returning quietly - a test that turns itself into a no-op without saying so
+// is the same silent-green problem this whole change is about.
+function makeDirLink(target) {
+  const parent = mkdtempSync(path.join(tmpdir(), "secret-gate-link-"));
+  const link = path.join(parent, "linked-repo");
+  try {
+    // "junction" is the Windows form that needs no elevation or developer
+    // mode; it is ignored on POSIX, where a plain symlink is made instead.
+    symlinkSync(target, link, "junction");
+  } catch {
+    rmSync(parent, { recursive: true, force: true });
+    return null;
+  }
+  // Removing the parent removes the link, never the linked-to repo: rmSync
+  // does not follow a symlink or a junction when deleting it.
+  return { link, cleanup: () => rmSync(parent, { recursive: true, force: true }) };
+}
+
+test("the vendored copy blocks when it is invoked through a symlinked path, not just a real one", (t) => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  installInto(dir);
+  writeFileSync(path.join(dir, "leak.md"), "STRIPE_KEY=" + STRIPE_SHAPED_KEY + "\n");
+  runGit(dir, "add", "-A");
+  const linked = makeDirLink(dir);
+  if (linked === null) return t.skip("this machine will not create a symlink");
+  try {
+    let status = 0;
+    let output = "";
+    try {
+      output = execFileSync(
+        process.execPath,
+        [path.join(linked.link, "scripts", "secret-gate", "cli.mjs"), "scan", "--staged"],
+        { cwd: linked.link, encoding: "utf8", stdio: "pipe" },
+      );
+    } catch (err) {
+      status = err.status;
+      output = (err.stdout ?? "") + (err.stderr ?? "");
+    }
+    assert.equal(status, 1, "the gate exited " + status + " through a symlinked path - it scanned nothing:\n" + output);
+    assert.match(output, /leak\.md/);
+  } finally {
+    linked.cleanup();
+  }
+});
+
+test("scan resolves an explicit path given through a symlinked repo root", (t) => {
+  const dir = makeRepo({ "docs/setup.md": "STRIPE_KEY=" + STRIPE_SHAPED_KEY + "\n" }, { commit: true });
+  const linked = makeDirLink(dir);
+  if (linked === null) return t.skip("this machine will not create a symlink");
+  try {
+    const { code, stdout } = runCli(dir, ["scan", path.join(linked.link, "docs", "setup.md")], { cwd: linked.link });
+    assert.equal(code, 1, "an absolute path through a symlink must not read as outside the repository:\n" + stdout);
+    assert.match(stdout, /docs\/setup\.md/);
+  } finally {
+    linked.cleanup();
+  }
 });
 
 test("install sets core.hooksPath", () => {
@@ -239,9 +337,18 @@ test("Finding 2: a crashed scanner still warns-and-allows even when set -e prece
   // fix, which only changes where a block lands when there are NO markers
   // yet. Whatever moved it there (a shebang flag, a legacy layout, a
   // hand-edit), a `set -e` ahead of our block is the scenario in question.
+  //
+  // `set -eu`, not `set -euo pipefail`, for the /bin/sh case: `-o pipefail`
+  // is a bash/ksh/zsh extension that dash - Ubuntu's /bin/sh - rejects
+  // outright with "set: Illegal option -o pipefail", aborting the HOST hook
+  // on its own second line before this plugin's block is ever reached. That
+  // made this test assert nothing about the block on Ubuntu while passing on
+  // macOS, where /bin/sh is bash. `set -e` is the part of the contract under
+  // test and is fully POSIX; the pipefail variant is covered by the bash test
+  // immediately below, run under a shell that actually has the option.
   const preexisting =
     "#!/usr/bin/env sh\n" +
-    "set -euo pipefail\n" +
+    "set -eu\n" +
     "# >>> secret-gate 0.0.1\n" +
     "echo stale\n" +
     "# <<< secret-gate\n";
@@ -255,6 +362,31 @@ test("Finding 2: a crashed scanner still warns-and-allows even when set -e prece
   runGit(dir, "add", "-A");
   const { status, output } = runHook(path.join(dir, ".githooks", "pre-commit"), { cwd: dir });
   assert.equal(status, 0, "a broken scanner must not block a commit when set -e precedes the block:\n" + output);
+});
+
+// The bash half of Finding 2: `set -euo pipefail` is what people actually
+// write at the top of a hook, and `-o pipefail` turns a failure anywhere in a
+// pipeline into the pipeline's status. Our block captures the scanner's exit
+// status with `|| __secret_gate_status=$?` in the SAME statement rather than
+// on a following line, which is what keeps both `-e` and `-o pipefail` from
+// aborting the hook on a crashed scanner (exit 2) that is meant to warn and
+// let the commit through.
+test("Finding 2 (bash): a crashed scanner still warns-and-allows under set -euo pipefail", { skip: hasBash() ? false : "bash is not on PATH" }, () => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+  const preexisting =
+    "#!/usr/bin/env bash\n" +
+    "set -euo pipefail\n" +
+    "# >>> secret-gate 0.0.1\n" +
+    "echo stale\n" +
+    "# <<< secret-gate\n";
+  writeFileSync(path.join(dir, ".githooks", "pre-commit"), preexisting);
+  installInto(dir);
+  writeFileSync(path.join(dir, ".secretgate.json"), "{ not json");
+  writeFileSync(path.join(dir, "clean.md"), "nothing secret here\n");
+  runGit(dir, "add", "-A");
+  const { status, output } = runHook(path.join(dir, ".githooks", "pre-commit"), { cwd: dir, shell: "bash" });
+  assert.equal(status, 0, "a broken scanner must not block a commit under set -euo pipefail:\n" + output);
 });
 
 // --- Finding 4 (Important, destructive): the workflow must not be

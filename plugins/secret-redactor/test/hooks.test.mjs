@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, mkdtempSync, writeFileSync, copyFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, copyFileSync, chmodSync, symlinkSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -423,34 +423,50 @@ test("PreToolUse: denies when file_path is not a string, rather than silently al
 // subprocess: it needs to fake out `git` itself on PATH, which is simplest
 // to do in-process for the duration of one call.
 //
-// The fake has to be a genuine .exe: Node's spawnSync (no shell) resolves an
-// extension-less command by appending ".exe" the way CreateProcess does, NOT
-// by trying PATHEXT the way cmd.exe would - a same-named "git.cmd" earlier on
-// PATH is silently skipped in favour of the real git.exe found later. A copy
-// of the current node binary IS a real .exe, so it resolves.
+// The fake is built differently per platform, because "put a fake `git`
+// earlier on PATH" means two different things:
 //
-// It also has to hang via a synchronous busy-loop, not `setTimeout`: Node
-// runs a `NODE_OPTIONS=--require` hook synchronously but then immediately
-// moves on to load argv[1] ("check-ignore") as its main module, which throws
-// "Cannot find module" and exits almost instantly - an async timer scheduled
-// in the hook never gets the chance to fire. A busy-loop blocks that startup
-// sequence for real.
+// WINDOWS: it has to be a genuine .exe. Node's spawnSync (no shell) resolves
+// an extension-less command by appending ".exe" the way CreateProcess does,
+// NOT by trying PATHEXT the way cmd.exe would - a same-named "git.cmd"
+// earlier on PATH is silently skipped in favour of the real git.exe found
+// later. A copy of the current node binary IS a real .exe, so it resolves,
+// and NODE_OPTIONS=--require makes that copy hang before it does anything.
+// It hangs via a synchronous busy-loop, not `setTimeout`: Node runs a
+// --require hook synchronously but then immediately moves on to load argv[1]
+// ("check-ignore") as its main module, which throws "Cannot find module" and
+// exits almost instantly - an async timer scheduled in the hook never gets
+// the chance to fire.
+//
+// POSIX: there is no ".exe" to append, so the Windows trick resolves nothing
+// and the REAL git answers in a few milliseconds - which is exactly how this
+// test passed on Windows while asserting nothing on Ubuntu and macOS, where
+// it failed with available:true (a real, fast, correct answer) rather than
+// the timeout it was written to prove. An executable file simply named `git`
+// is what PATH lookup finds here. It `exec`s sleep so the process spawnSync
+// signals on timeout IS the sleeping process - a plain `sleep 7` would leave
+// a grandchild alive after the shell was killed.
 function makeHangingGit(hangMs) {
   const dir = mkdtempSync(path.join(tmpdir(), "fake-hanging-git-"));
-  const gitExe = path.join(dir, "git.exe");
-  copyFileSync(process.execPath, gitExe);
-  const sleeper = path.join(dir, "sleeper.js");
-  writeFileSync(sleeper, `const end = Date.now() + ${hangMs}; while (Date.now() < end) {} process.exit(0);`);
-  return { dir, sleeper };
+  if (process.platform === "win32") {
+    copyFileSync(process.execPath, path.join(dir, "git.exe"));
+    const sleeper = path.join(dir, "sleeper.js");
+    writeFileSync(sleeper, `const end = Date.now() + ${hangMs}; while (Date.now() < end) {} process.exit(0);`);
+    return { dir, env: { NODE_OPTIONS: "--require " + sleeper } };
+  }
+  const fakeGit = path.join(dir, "git");
+  writeFileSync(fakeGit, `#!/bin/sh\nexec sleep ${Math.ceil(hangMs / 1000)}\n`);
+  chmodSync(fakeGit, 0o755);
+  return { dir, env: {} };
 }
 
 test("gitIgnores: times out rather than hanging forever when git itself hangs (Finding 3)", () => {
   const cwd = makeRepo({});
-  const { dir: fakeGitDir, sleeper } = makeHangingGit(7000); // hangs ~7s; the guard's own timeout is 5s
+  const { dir: fakeGitDir, env: fakeEnv } = makeHangingGit(7000); // hangs ~7s; the guard's own timeout is 5s
   const originalPath = process.env.PATH;
-  const originalNodeOptions = process.env.NODE_OPTIONS;
+  const originalEnv = Object.fromEntries(Object.keys(fakeEnv).map((k) => [k, process.env[k]]));
   process.env.PATH = fakeGitDir + path.delimiter + originalPath;
-  process.env.NODE_OPTIONS = "--require " + sleeper;
+  Object.assign(process.env, fakeEnv);
   try {
     const start = Date.now();
     const result = gitIgnores(path.join(cwd, "notes.md"), cwd);
@@ -459,11 +475,17 @@ test("gitIgnores: times out rather than hanging forever when git itself hangs (F
       elapsed < 6000,
       `gitIgnores took ${elapsed}ms against a hanging git; expected it to be killed well under 6000ms`,
     );
+    assert.ok(
+      elapsed > 1000,
+      `gitIgnores returned in ${elapsed}ms - the fake hanging git was not the one that answered, so this test proved nothing`,
+    );
     assert.deepEqual(result, { available: false, ignored: false });
   } finally {
     process.env.PATH = originalPath;
-    if (originalNodeOptions === undefined) delete process.env.NODE_OPTIONS;
-    else process.env.NODE_OPTIONS = originalNodeOptions;
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 
@@ -622,6 +644,48 @@ test("PreToolUse: an allowlisted path allows a write that would otherwise deny",
   );
   assert.equal(code, 0);
   assert.equal(stdout, "", "an allowlisted path must allow silently, just like a clean write");
+});
+
+// The same symlink/short-path mismatch that made the vendored CLI a no-op
+// (see cli-install.test.mjs) also silently broke the allowlist here: repoRoot
+// comes from git and file_path comes from the tool call, so path.relative()
+// between the two spellings produced "../../../../var/folders/.../corpus.txt"
+// instead of "test/fixtures/corpus.txt", matched no `paths` entry, and the
+// guard denied a write the repo had explicitly allowed. That failed on the
+// macOS and Windows legs of CI and passed on Ubuntu purely because Ubuntu's
+// /tmp is not a symlink. Constructing the symlink pins it everywhere.
+test("PreToolUse: an allowlisted path still allows when the repo is reached through a symlink", async (t) => {
+  const real = makeRepo({
+    [ALLOWLIST_FILE]: JSON.stringify({ version: 1, paths: ["^test/fixtures/"] }),
+    "test/fixtures/.gitkeep": "",
+  });
+  const parent = mkdtempSync(path.join(tmpdir(), "secret-gate-link-"));
+  const cwd = path.join(parent, "linked-repo");
+  try {
+    // "junction" needs no elevation or developer mode on Windows and is
+    // ignored on POSIX, where a plain symlink is made instead.
+    symlinkSync(real, cwd, "junction");
+  } catch {
+    rmSync(parent, { recursive: true, force: true });
+    return t.skip("this machine will not create a symlink");
+  }
+  try {
+    const { code, stdout } = await runHook(
+      "guard-write.mjs",
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: { file_path: path.join(cwd, "test", "fixtures", "corpus.txt"), content: "STRIPE_KEY=" + LIVE },
+      },
+      { cwd },
+    );
+    assert.equal(code, 0);
+    assert.equal(stdout, "", "an allowlisted path reached through a symlink must allow, same as through the real path");
+  } finally {
+    // Removes the link, not the repo it points at - rmSync does not follow
+    // a symlink or junction when deleting it.
+    rmSync(parent, { recursive: true, force: true });
+  }
 });
 
 test("PreToolUse: a non-allowlisted path in the same repo still denies", async () => {
