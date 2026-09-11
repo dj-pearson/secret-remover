@@ -24,7 +24,7 @@
 // not a gate.
 //
 // So: canonicalize BOTH sides before ever comparing them.
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 
 // realpathSync.native is what resolves an 8.3 short name and normalizes
@@ -91,4 +91,36 @@ export function samePath(a, b) {
   if (a === b) return true;
   if (process.platform === "win32") return a.toLowerCase() === b.toLowerCase();
   return false;
+}
+
+// Answers "do these two names denote the same file?" without assuming either
+// name is spelled canonically - because on Windows neither one is, and they
+// are not un-canonical in the SAME way:
+//
+//   fs.realpathSync.native   expands an 8.3 short name and fixes casing
+//   Node's own ESM resolver  resolves symlinks and junctions, but does NOT
+//                            expand a short name
+//
+// So under a short TEMP path, `import.meta.url` keeps C:/Users/RUNNER~1/...
+// while realpath gives C:/Users/runneradmin/... - canonicalizing only ONE
+// side swaps which of the two is wrong and the comparison stays false. That
+// is not hypothetical: it is what the first attempt at this fix did, and it
+// turned a passing Windows leg red while fixing macOS.
+//
+// Asking the filesystem for identity sidesteps the whole spelling question:
+// st_dev + st_ino is the same pair for every name of one file, on POSIX and
+// on Windows (where Node fills them from the NTFS file index). Falling back
+// to canonicalizing BOTH sides covers a filesystem that reports no usable
+// inode, and only then does string comparison happen at all.
+export function isSameFile(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length === 0 || b.length === 0) return false;
+  try {
+    const sa = statSync(a);
+    const sb = statSync(b);
+    if (sa.ino !== 0 && sb.ino !== 0 && sa.dev === sb.dev && sa.ino === sb.ino) return true;
+  } catch {
+    // One of them does not exist or cannot be stat'd - fall through to the
+    // string comparison rather than deciding anything from the failure.
+  }
+  return samePath(canonicalize(a), canonicalize(b));
 }

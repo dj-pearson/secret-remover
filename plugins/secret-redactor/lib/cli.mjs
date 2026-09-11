@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { findSecrets, newState, redactRanges, MAX_SCAN_BYTES } from "./detect.mjs";
 import { loadAllowlist, isAllowed, staleEntries, ALLOWLIST_FILE } from "./allowlist.mjs";
 import { gitEnv } from "./gitignore.mjs";
-import { canonicalize, canonicalizeParent, samePath } from "./paths.mjs";
+import { canonicalize, canonicalizeParent, isSameFile } from "./paths.mjs";
 
 export const VERSION = "2.1.0";
 
@@ -877,22 +877,20 @@ export async function main(argv = process.argv.slice(2)) {
 // runs, and the process exits 0 having scanned nothing - a pre-commit gate
 // that is silently not a gate, in every repo it was vendored into.
 //
-// The previous version compared `import.meta.url` against
-// pathToFileURL(process.argv[1]) verbatim, and that is exactly the failure it
-// warned about. Node resolves a module specifier through realpath before
-// recording import.meta.url, while argv[1] is whatever the caller typed. Any
-// symlink or alias anywhere in the path makes the two differ:
+// The original compared `import.meta.url` against pathToFileURL(argv[1])
+// verbatim, and that is exactly the failure it warned about: Node resolves a
+// module specifier through realpath before recording import.meta.url, while
+// argv[1] is whatever the caller typed. On macOS `node /var/folders/.../
+// cli.mjs` gives an import.meta.url of file:///private/var/folders/... - the
+// gate ran, printed nothing, and exited 0 on a staged live credential.
 //
-//   macOS   node /var/folders/x/T/repo/scripts/secret-gate/cli.mjs
-//           -> import.meta.url is file:///private/var/folders/x/T/repo/...
-//   Windows node C:\Users\RUNNER~1\...\cli.mjs
-//           -> import.meta.url is file:///C:/Users/runneradmin/...
-//
-// In both cases the gate ran, printed nothing, and exited 0 on a staged live
-// credential. Canonicalize argv[1] the same way Node canonicalized the module
-// URL, and compare with the platform's own case rules.
+// Canonicalizing argv[1] alone is NOT the fix, and was tried: on Windows the
+// two sides are un-canonical in different ways (realpath expands an 8.3 short
+// name, Node's resolver does not), so normalizing one side just moves which
+// one is wrong - it fixed macOS and broke Windows in the same push. Compare
+// by filesystem identity instead; see isSameFile() in lib/paths.mjs.
 const entryPath = typeof process.argv[1] === "string" && process.argv[1].length > 0 ? process.argv[1] : null;
-const invokedDirectly = entryPath !== null && samePath(canonicalize(entryPath), fileURLToPath(import.meta.url));
+const invokedDirectly = entryPath !== null && isSameFile(entryPath, fileURLToPath(import.meta.url));
 
 if (invokedDirectly) {
   main().then((code) => process.exit(code));
