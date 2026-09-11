@@ -225,11 +225,11 @@ test("fix redacts a hit that ends exactly at end-of-file", () => {
 // `regexes` entry that matches its exact value - the OTHER one must still
 // be found and replaced, and the allowlisted one must survive untouched.
 test("fix replaces only the non-allowlisted hit when a file has a mix of both", () => {
-  const ALLOWED = LIVE; // "sk_TEST_live_a1b2c3d4e5f6g7h8i9j0k1l2"
+  const ALLOWED = LIVE;
   const NOT_ALLOWED = "sk_live_" + "z9y8x7w6v5u4t3s2r1q0p9o8";
   const dir = makeRepo({
     "a.md": "ALLOWED=" + ALLOWED + "\nNOT_ALLOWED=" + NOT_ALLOWED + "\n",
-    ".secretgate.json": JSON.stringify({ version: 1, regexes: ["^sk_TEST_live_a1b2c3d4"] }),
+    ".secretgate.json": JSON.stringify({ version: 1, regexes: ["^" + ALLOWED.slice(0, 14)] }),
   });
   const { code, stdout } = runCli(dir, ["fix", "--staged"]);
   assert.equal(code, 0);
