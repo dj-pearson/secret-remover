@@ -575,30 +575,74 @@ function writeLf(file, contents) {
   writeFileSync(file, contents.replaceAll("\r\n", "\n"), { encoding: "utf8" });
 }
 
-// Splices `block` into `existing`, or says why it refuses to.
+// Splices `block` into `existing`, or says why it refuses to. `full` is the
+// whole rendered template (shebang included) - only needed for the
+// empty/whitespace-only case below, which has no existing shebang or
+// content worth preserving and should get the real thing instead of a
+// bare, shebang-less block.
 //
-// Three cases:
-//   - both markers present, end after start: replace exactly that span.
-//     `end` is searched for FROM `start`'s index, not from 0 - searching
-//     from 0 is what let a lone start marker with leftover user content
-//     below it get treated as "found a pair" against a LATER end marker
-//     that this function itself had appended on a previous run, deleting
-//     everything in between (review Finding 5).
-//   - exactly one marker present: a hand-edited or corrupted block. Refuse
-//     rather than guess which half is missing - a wrong guess here can
-//     delete the rest of the file's content, permanently, the first time
-//     someone re-runs install.
+// Cases, in order:
+//   - existing is empty or nothing but whitespace (after stripping a
+//     leading BOM, see below): there is no shebang to preserve and nothing
+//     of the user's to splice around, so write the FULL template - which
+//     carries its own shebang - rather than just `block` (review Finding
+//     C). A bare block with no shebang at all only ever ran in testing
+//     because git fell back to a shell for a file with no valid
+//     interpreter line; that is luck, not something to build on.
+//   - both markers present, end after start, and no SECOND start marker
+//     inside that span: replace exactly the span from the first start to
+//     its matching end. `end` is searched for FROM `start`'s index, not
+//     from 0 (unless `start` itself is -1 - see the next bullet) -
+//     searching from 0 is what let a lone start marker with leftover user
+//     content below it get treated as "found a pair" against a LATER end
+//     marker this function itself had appended on a previous run,
+//     deleting everything in between (review Finding 5). A duplicate
+//     start marker inside an otherwise well-formed span is the same class
+//     of hazard one layer in: splicing first-start to first-end without
+//     checking for it silently deletes every line between the two start
+//     markers (review Finding A) while printing a note that says "left
+//     the rest alone" - so it is refused here rather than guessed at, the
+//     same as a genuinely unmatched marker.
+//   - exactly one marker present: a hand-edited or corrupted block.
+//     Refuse rather than guess which half is missing - a wrong guess here
+//     can delete the rest of the file's content, permanently, the first
+//     time someone re-runs install. `end` is searched from 0 when `start`
+//     is -1 specifically so a file with an end marker and no start marker
+//     is actually caught here rather than silently falling through to the
+//     no-markers case below (review Finding B - the old `end = start ===
+//     -1 ? -1 : ...` forced `end` to -1 whenever `start` was -1, which
+//     made this arm of the refusal message unreachable dead code).
 //   - no markers at all: insert right after the shebang line, not at
 //     end-of-file (review Finding 1). A host hook this is merged into may
 //     itself `exit` before reaching end-of-file - gitleaks's own hook exits
 //     0 when gitleaks is not installed, which is the ordinary case, not an
 //     edge case. A block appended at EOF would then simply never run.
-//     Running first means nothing later in the file can ever skip it.
-function spliceHook(existing, block) {
-  const start = existing.indexOf(MARK_START);
-  const end = start === -1 ? -1 : existing.indexOf(MARK_END, start);
+//     Running first means nothing later in the file can ever skip it. A
+//     leading BOM is stripped before this check (review Finding C): `\s`
+//     (used by the leading-whitespace trim further down) matches U+FEFF,
+//     so a BOM ahead of `#!` used to be swallowed together with the
+//     shebang line itself, demoting the host's real interpreter directive
+//     to an inert comment partway through the file. Stripping it first
+//     means the real shebang is found and the block still lands right
+//     after it.
+function spliceHook(existing, block, full) {
+  const noBom = existing.startsWith("\uFEFF") ? existing.slice(1) : existing;
+  if (noBom.trim() === "") {
+    return { ok: true, text: full };
+  }
+  const start = noBom.indexOf(MARK_START);
+  const end = noBom.indexOf(MARK_END, start === -1 ? 0 : start);
   if (start !== -1 && end !== -1 && end > start) {
-    return { ok: true, text: existing.slice(0, start) + block.trim() + existing.slice(end + MARK_END.length) };
+    const secondStart = noBom.indexOf(MARK_START, start + MARK_START.length);
+    if (secondStart !== -1 && secondStart < end) {
+      return {
+        ok: false,
+        error:
+          `found a second '${MARK_START}' before the matching '${MARK_END}' - refusing to touch .githooks/pre-commit. ` +
+          "Remove the duplicate marker line by hand, then re-run install.",
+      };
+    }
+    return { ok: true, text: noBom.slice(0, start) + block.trim() + noBom.slice(end + MARK_END.length) };
   }
   if (start !== -1 || end !== -1) {
     const which = start !== -1 ? MARK_START : MARK_END;
@@ -609,13 +653,13 @@ function spliceHook(existing, block) {
         "Remove the stray marker line (or restore its pair) by hand, then re-run install.",
     };
   }
-  const shebangEnd = existing.startsWith("#!") ? existing.indexOf("\n") : -1;
+  const shebangEnd = noBom.startsWith("#!") ? noBom.indexOf("\n") : -1;
   if (shebangEnd === -1) {
-    return { ok: true, text: block.trim() + "\n\n" + existing.replace(/^\s+/, "") };
+    return { ok: true, text: block.trim() + "\n\n" + noBom.replace(/^\s+/, "") };
   }
   return {
     ok: true,
-    text: existing.slice(0, shebangEnd + 1) + "\n" + block.trim() + "\n\n" + existing.slice(shebangEnd + 1).replace(/^\s+/, ""),
+    text: noBom.slice(0, shebangEnd + 1) + "\n" + block.trim() + "\n\n" + noBom.slice(shebangEnd + 1).replace(/^\s+/, ""),
   };
 }
 
@@ -664,7 +708,7 @@ function install(args) {
   const block = full.slice(full.indexOf(MARK_START));
   let hookWritten = false;
   if (existsSync(hookFile)) {
-    const spliced = spliceHook(readFileSync(hookFile, "utf8"), block);
+    const spliced = spliceHook(readFileSync(hookFile, "utf8"), block, full);
     if (spliced.ok) {
       writeLf(hookFile, spliced.text);
       notes.push("updated the secret-gate block in .githooks/pre-commit, left the rest alone");

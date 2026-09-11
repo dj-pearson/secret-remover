@@ -52,11 +52,32 @@ function registerCleanup(dir) {
 // included) broke every fixture before this fix. This is the identical
 // class Correction 2 closes in lib/cli.mjs - one function, reused here
 // rather than a second, weaker copy of the same idea.
+//
+// HOME/USERPROFILE/XDG_CONFIG_HOME are pointed at a directory unique to this
+// fixture for a reason that only bit when this function started being
+// reused for runCli() (Task 11 review, Finding D): GIT_CONFIG_GLOBAL/SYSTEM
+// only isolate a DIRECT git invocation like the ones in this file. runCli()
+// spawns `node cli.mjs`, and cli.mjs's OWN internal git() wrapper calls
+// gitEnv() before every git command IT makes - which deletes every
+// GIT_*-prefixed variable, GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM included,
+// by design (that is exactly what protects it from a poisoned GIT_DIR
+// inherited from a real pre-commit invocation). So a GIT_CONFIG_GLOBAL set
+// here never survives to reach the actual git process cli.mjs spawns -
+// verified directly: setting it alone still left `install sets
+// core.hooksPath` reading a real `git config --global core.hooksPath` set
+// on this machine. HOME and USERPROFILE are not GIT_*-prefixed, survive
+// gitEnv()'s strip untouched, and are what git actually falls back to for
+// finding `~/.gitconfig` once GIT_CONFIG_GLOBAL is gone - so they are the
+// only lever that reaches through cli.mjs's own protective stripping.
 function isolatedGitEnv(dir) {
+  const fakeHome = path.join(dir, ".unused-home");
   return {
     ...gitEnv(),
     GIT_CONFIG_GLOBAL: path.join(dir, ".unused-global-gitconfig"),
     GIT_CONFIG_SYSTEM: path.join(dir, ".unused-system-gitconfig"),
+    HOME: fakeHome,
+    USERPROFILE: fakeHome,
+    XDG_CONFIG_HOME: path.join(dir, ".unused-xdg-config"),
   };
 }
 
@@ -125,6 +146,19 @@ export function runGit(cwd, ...args) {
 // overrides where the CLI process actually runs from (default: the repo
 // root `dir`) - tests use this for explicit-path arguments resolved against
 // a subdirectory, e.g. `cd docs && secret-gate scan setup.md`.
+//
+// Task 11 review, Finding D: the default used to be `env ?? process.env`,
+// which means `install` (and every other command run through this helper)
+// read the DEVELOPER'S GLOBAL git config - unlike makeRepo()'s own git
+// calls, which have used isolatedGitEnv() from the start. A machine with no
+// global core.hooksPath (this one) can't tell the difference, but a test
+// like "install refuses to change a core.hooksPath that points elsewhere"
+// silently changes what it's asserting on a machine that has one set - a
+// test whose meaning depends on the machine it runs on is worse than one
+// that fails, because this plugin's entire purpose is to be installed on a
+// second machine, and its own README tells someone to run this suite there.
+// Defaulting to the same isolatedGitEnv(dir) makeRepo() already uses closes
+// that, while an explicit `env` (the GIT_* poisoning tests) still wins.
 export function runCli(dir, args, { env, cwd } = {}) {
   const cliPath = path.join(
     path.dirname(path.dirname(fileURLToPath(import.meta.url))),
@@ -137,7 +171,7 @@ export function runCli(dir, args, { env, cwd } = {}) {
       cwd: cwd ?? dir,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      env: env ?? process.env,
+      env: env ?? isolatedGitEnv(dir),
     });
     return { code: 0, stdout, stderr: "" };
   } catch (err) {

@@ -297,6 +297,84 @@ test("Finding 5: a lone start marker with no matching end marker is refused, not
   assert.match(second.stdout, /marker/i);
 });
 
+// --- Finding A (Important, destructive): a duplicate start marker inside
+// an otherwise well-formed span must not delete what's between the two. --
+
+test("Finding A: a second start marker between a real pair is refused, not spliced into data loss", () => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+  const broken =
+    "#!/usr/bin/env sh\n" +
+    "# >>> secret-gate 1.0.0\n" +
+    "echo user-line-1\n" +
+    "# >>> secret-gate 1.0.0\n" +
+    "echo user-line-2\n" +
+    "# <<< secret-gate\n" +
+    "echo user-line-3\n";
+  writeFileSync(path.join(dir, ".githooks", "pre-commit"), broken);
+
+  const first = installInto(dir);
+  const after1 = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
+  assert.equal(after1, broken, "install must not delete content between a duplicate start marker and the real end marker");
+  assert.match(first.stdout, /marker/i);
+  assert.doesNotMatch(first.stdout, /left the rest alone/, "the note must not claim success when it refused");
+
+  const second = installInto(dir);
+  const after2 = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
+  assert.equal(after2, broken, "a second install must not touch it either");
+});
+
+// --- Finding B (Minor): the end-marker-only refusal must be reachable. ---
+
+test("Finding B: a lone end marker with no start marker is refused (the mirror case of Finding 5)", () => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+  const broken = "#!/usr/bin/env sh\necho before\n# <<< secret-gate\necho after\n";
+  writeFileSync(path.join(dir, ".githooks", "pre-commit"), broken);
+
+  const { stdout } = installInto(dir);
+  const after = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
+  assert.equal(after, broken, "a lone end marker must be refused, not silently treated as no-markers-at-all");
+  assert.match(stdout, /marker/i);
+});
+
+// --- Finding C (Minor): the shebang must survive an empty file, a
+// whitespace-only file, and a BOM sitting ahead of a real shebang. --------
+
+test("Finding C: installing over an empty existing hook file writes the full template, shebang included", () => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+  writeFileSync(path.join(dir, ".githooks", "pre-commit"), "");
+  installInto(dir);
+  const after = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
+  assert.match(after, /^#!\/usr\/bin\/env sh\n/, "an empty existing hook must not lose the shebang");
+  assert.match(after, /# >>> secret-gate/);
+});
+
+test("Finding C: installing over a whitespace-only existing hook file writes the full template, shebang included", () => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+  writeFileSync(path.join(dir, ".githooks", "pre-commit"), "   \n\n\t\n");
+  installInto(dir);
+  const after = readFileSync(path.join(dir, ".githooks", "pre-commit"), "utf8");
+  assert.match(after, /^#!\/usr\/bin\/env sh\n/, "a whitespace-only existing hook must not lose the shebang");
+  assert.match(after, /# >>> secret-gate/);
+});
+
+test("Finding C: a BOM ahead of the host's shebang does not demote it to an inert comment", () => {
+  const dir = makeRepo({ "a.md": "clean\n" });
+  mkdirSync(path.join(dir, ".githooks"), { recursive: true });
+  const withBom = "\uFEFF#!/usr/bin/env bash\nset -e\necho host-body\n";
+  writeFileSync(path.join(dir, ".githooks", "pre-commit"), withBom);
+  installInto(dir);
+  const raw = readFileSync(path.join(dir, ".githooks", "pre-commit"));
+  const text = raw.toString("utf8");
+  assert.ok(!raw.includes(Buffer.from("\uFEFF", "utf8")), "the BOM must not survive into the merged file");
+  assert.match(text, /^#!\/usr\/bin\/env bash\n/, "the host's real shebang must be the file's first line, not an inert comment further down");
+  assert.match(text, /echo host-body/, "the host's own body must survive alongside the block");
+  assert.match(text, /# >>> secret-gate/);
+});
+
 // --- Finding 6 (Important): the hook must be staged executable, or POSIX
 // git on a clone from this machine silently never runs it. -----------------
 
