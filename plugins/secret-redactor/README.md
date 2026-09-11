@@ -1,7 +1,8 @@
 # secret-redactor
 
 Keeps plaintext credentials out of Claude Code transcripts, out of files, and
-out of GitHub. Zero dependencies, Node 22+, ESM only.
+out of GitHub - for the credential shapes it recognizes; see Known
+limitations for what that leaves out. Zero dependencies, Node 22+, ESM only.
 
 ## What it does
 
@@ -15,8 +16,10 @@ Four surfaces, four defenses:
    the case where the secret came from a file Claude read, not from you.
 3. **File writes.** `PreToolUse` on `Write`/`Edit`/`NotebookEdit` refuses the
    write outright rather than redacting it (`hooks/guard-write.mjs`). This is
-   the gate that stops a key reaching a repo file at all, before git is ever
-   involved.
+   the gate that stops a key reaching a repo file through Claude Code's
+   file-editing tools, before git is ever involved - it does not see a write
+   made through the Bash tool (`cat > x`, `tee`, a script); see Known
+   limitations.
 4. **Commits.** A generated `.githooks/pre-commit` hook scans everything
    staged and refuses the commit if a credential is in it. The same scan runs
    again in CI, so a commit made from a machine without this plugin installed
@@ -104,15 +107,26 @@ Running `install` (or `/secret-gate install`) in a repo writes:
 - `.github/workflows/secret-gate.yml` - the CI job. Written when missing,
   rewritten when it carries an older secret-gate version stamp, left alone
   otherwise (including a hand-written workflow with no stamp at all).
+  `--force` rewrites it unconditionally, regardless of stamp.
 - `.gitattributes` - pins `.githooks/**` to LF, because a CRLF shebang
   breaks Git-for-Windows `sh`.
+- `core.hooksPath` - set to `.githooks` in the repo's git config, but only
+  when it's currently unset or already `.githooks`. If it points somewhere
+  else, install leaves it alone rather than overwrite a setup you already
+  have a reason for.
 
-**`install` refuses rather than guesses.** If `.githooks/pre-commit` has a
-marker that's missing its pair, or a duplicate start marker inside what
-looks like a real span, install leaves the file untouched, prints why on
-stdout, and exits non-zero. A wrong guess there could delete everything
-between two markers permanently the next time someone re-runs install; a
-loud refusal is the only safe response to a state the tool can't interpret.
+**`install` refuses rather than guesses, in two different ways, and exits
+non-zero either time.** If `.githooks/pre-commit` has a marker that's
+missing its pair, or a duplicate start marker inside what looks like a real
+span, install leaves the file untouched. A wrong guess there could delete
+everything between two markers permanently the next time someone re-runs
+install; a loud refusal is the only safe response to a state the tool can't
+interpret. Separately, if `core.hooksPath` already points somewhere other
+than `.githooks`, the gate is never actually wired into git no matter how
+many of the other files above got written - install still leaves that
+alone rather than override it, and exits non-zero for the same reason: a
+scripted install across many repos must not read either kind of refusal as
+success. Both cases print exactly what happened and what to run by hand.
 
 ## `.secretgate.json`
 
@@ -124,6 +138,10 @@ loud refusal is the only safe response to a state the tool can't interpret.
   "fingerprints": ["test/fixtures/sample.env:stripe-key:12"]
 }
 ```
+
+`version` must be exactly `1` (a missing `version` field is also treated as
+`1`). Any other value is a hard error - `scan`/`fix` refuse to run rather
+than silently reinterpret a future schema under today's rules.
 
 - `paths` - allowlist an entire file by its repo-relative path.
 - `regexes` - allowlist any matched value that fits the pattern (a synthetic
@@ -153,23 +171,84 @@ stale. Remove it. An allowlist can only be trusted if it shrinks.
 
 ## Exit codes
 
-- `0` - clean.
-- `1` - a credential was found (or, with `--strict`, something was skipped).
+Exit codes mean different things for different commands - don't read `1`
+from `install` as "a credential was found." Nothing in `install` scans for
+credentials at all.
+
+**`scan` and `fix --staged`:**
+
+- `0` - clean (or, for `fix`, every finding in scope was fixed or was
+  already allowlisted).
+- `1` - a credential was found (or, with `--strict`, something was skipped);
+  for `fix`, a real unresolved finding remains (invalid UTF-8, a symlink,
+  staged/worktree divergence, a write failure).
 - `2` - the scanner itself broke (bad usage, unreadable `.secretgate.json`,
   not a git repo).
 
-`--strict` is CI-only by design. The generated pre-commit hook does **not**
-pass it; the generated `secret-gate.yml` workflow does. That's a deliberate
-asymmetry: locally, a scanner that broke on one unreadable file (an
-oversized image, say) still **warns and lets the commit through**, because a
-gate that can brick a developer's commit over a file it couldn't check is a
-gate people learn to route around, and a gate people disable protects
-nothing. In CI, the same broken-scanner exit code **fails the build**,
-because no human is waiting on it there and a red build is the right
-response to "the scanner couldn't check something."
+`--strict` is a `scan`-only flag, and CI-only by convention. The generated
+pre-commit hook does **not** pass it; the generated `secret-gate.yml`
+workflow does. That's a deliberate asymmetry: locally, a scanner that broke
+on one unreadable file (an oversized image, say) still **warns and lets the
+commit through**, because a gate that can brick a developer's commit over a
+file it couldn't check is a gate people learn to route around, and a gate
+people disable protects nothing. In CI, the same broken-scanner exit code
+**fails the build**, because no human is waiting on it there and a red
+build is the right response to "the scanner couldn't check something."
+
+**`install`:**
+
+- `0` - the gate is wired into git (or already was).
+- `1` - install refused to finish wiring the gate up: either
+  `.githooks/pre-commit` had a marker it wouldn't guess how to fix, or
+  `core.hooksPath` already points somewhere other than `.githooks`. Every
+  other file `install` writes (the vendored library, the allowlist, the CI
+  workflow, `.gitattributes`) may still have been written even when it
+  exits `1` - read stdout for exactly which step refused. A script driving
+  `install` across many repos must treat this as "not installed here,"
+  never as success.
+- `2` - not a git repository, or some other internal error before any file
+  was written.
+
+## Shipping a new version
+
+Four places have to move together, not three - `test/version.test.mjs`
+asserts all four are equal and fails the build if they drift:
+
+- `plugins/secret-redactor/package.json` (`version`)
+- `plugins/secret-redactor/.claude-plugin/plugin.json` (`version`)
+- the `secret-redactor` entry in the root `.claude-plugin/marketplace.json`
+  (`version`)
+- `VERSION` in `plugins/secret-redactor/lib/cli.mjs`
+
+That fourth one matters beyond keeping a number consistent: `install` stamps
+it into every repo it vendors into, so a mismatch there means a vendored
+copy reports the wrong version and its own staleness check (whether an
+installed CI workflow is older than the plugin) goes quiet without anyone
+noticing.
 
 ## Known limitations
 
+- **Detection is a fixed pattern list, not entropy-based.** Eighteen
+  labeled formats (AWS, GitHub, Stripe, Anthropic, OpenAI, Google, Slack,
+  npm, PyPI, SendGrid, Twilio, Discord, a private-key block, a JWT, a URL
+  password, a bearer token) plus one heuristic for a `KEY: value` /
+  `key=value` assignment where the key name looks credential-shaped. A
+  credential with no recognizable prefix and no labeled assignment near it
+  - a bare high-entropy string - passes every surface here silently. This
+  tool is not a substitute for not committing secrets in the first place.
+- **File writes made through the Bash tool are not covered.** The write
+  guard's matcher is `Write`/`Edit`/`NotebookEdit` only; a file created or
+  overwritten via the Bash tool (`cat > x`, `tee`, a script Claude runs)
+  never reaches it. The commit gate (surface 4) is the real backstop for
+  that path - it catches the credential at `git add`/commit time instead of
+  at write time.
+- **A redacted tool result can make a later `Edit` fail to match.** If
+  surface 2 rewrites a credential in a file Claude just read, the model
+  only ever sees the `[REDACTED <kind> #n]` marker, not the original value.
+  An `Edit` call built from that read, with the real value as `old_string`,
+  will not match what's actually in the file. This is the intended
+  trade-off, not a bug - the alternative is leaving the real value visible
+  to the model.
 - **`fix --staged` refuses rather than repairs when the index and worktree
   diverge.** If a staged file was hand-edited afterward, deleted, or
   partially staged with `git add -p`, `fix` will not guess which version is
@@ -199,6 +278,14 @@ response to "the scanner couldn't check something."
   configuration, not an environment variable, and nothing in this plugin's
   test harness can simulate or block that. No machine this was built on has
   one set, so this is untested territory rather than a confirmed gap.
+- **Surface 1 (pasted prompts) is documented behavior, not yet observed
+  behavior.** Whether the installed build of Claude Code actually honors
+  `updatedPrompt` in a `UserPromptSubmit` hook response has not been
+  confirmed on this machine - it's what the field is documented to do, not
+  something watched happen. Surface 2 (`PostToolUse` / `updatedToolOutput`)
+  is observably live. If `updatedPrompt` turns out to be ignored, the
+  fallback is to have the hook deny the prompt outright instead of
+  rewriting it - worse for the person typing, but still safe.
 - **This plugin has only been exercised on Windows so far.** The test suite
   has a documented skip (this sandbox can't create real symlinks) and a
   hung-git regression test that is Windows-specific by construction (it
