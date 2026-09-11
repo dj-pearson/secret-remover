@@ -228,8 +228,8 @@ noticing.
 
 ## Known limitations
 
-- **Detection is a fixed pattern list, not entropy-based.** Eighteen
-  labeled formats (AWS, GitHub, Stripe, Anthropic, OpenAI, Google, Slack,
+- **Detection is a fixed pattern list, not entropy-based.** Seventeen
+  fixed formats (AWS, GitHub, Stripe, Anthropic, OpenAI, Google, Slack,
   npm, PyPI, SendGrid, Twilio, Discord, a private-key block, a JWT, a URL
   password, a bearer token) plus one heuristic for a `KEY: value` /
   `key=value` assignment where the key name looks credential-shaped. A
