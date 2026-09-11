@@ -69,7 +69,11 @@ function registerCleanup(dir) {
 // gitEnv()'s strip untouched, and are what git actually falls back to for
 // finding `~/.gitconfig` once GIT_CONFIG_GLOBAL is gone - so they are the
 // only lever that reaches through cli.mjs's own protective stripping.
-function isolatedGitEnv(dir) {
+// Exported (not just used internally) so a test that needs to READ something
+// with git - not just run a void write through runGit() - can still get the
+// same GIT_*-stripped isolation rather than falling back to a bare
+// execFileSync with the inherited (possibly poisoned) environment.
+export function isolatedGitEnv(dir) {
   const fakeHome = path.join(dir, ".unused-home");
   return {
     ...gitEnv(),

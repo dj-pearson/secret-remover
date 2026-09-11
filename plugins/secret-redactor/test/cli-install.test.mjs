@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { makeRepo, runCli, runGit } from "./helpers/temp-repo.mjs";
+import { makeRepo, runCli, runGit, isolatedGitEnv } from "./helpers/temp-repo.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const GITLEAKS_HOOK = readFileSync(path.join(HERE, "fixtures", "gitleaks-pre-commit"), "utf8");
@@ -94,7 +94,10 @@ test("the vendored copy actually runs and blocks", () => {
 test("install sets core.hooksPath", () => {
   const dir = makeRepo({ "a.md": "clean\n" });
   installInto(dir);
-  const value = execFileSync("git", ["config", "core.hooksPath"], { cwd: dir, encoding: "utf8" }).trim();
+  // Isolated env, same as the write beside it in the next test - a bare
+  // execFileSync here would read whatever repo an inherited GIT_DIR names
+  // instead of `dir`, same class as the writes runGit() already protects.
+  const value = execFileSync("git", ["config", "core.hooksPath"], { cwd: dir, encoding: "utf8", env: isolatedGitEnv(dir) }).trim();
   assert.equal(value, ".githooks");
 });
 
@@ -164,10 +167,16 @@ test("install refuses to change a core.hooksPath that points elsewhere", () => {
   // core.hooksPath on that OTHER repo while `dir` stayed untouched. runGit()
   // strips every GIT_*-prefixed variable before spawning, closing that.
   runGit(dir, "config", "core.hooksPath", ".myhooks");
-  const { stdout } = installInto(dir);
+  const { stdout, code } = installInto(dir);
   assert.match(stdout, /core\.hooksPath/);
   assert.match(stdout, /\.myhooks/);
-  const value = execFileSync("git", ["config", "core.hooksPath"], { cwd: dir, encoding: "utf8" }).trim();
+  // Review Finding 4: this branch leaves the gate NOT wired into git at all
+  // (core.hooksPath still points at .myhooks, which was never told about
+  // .githooks/pre-commit) - the identical failure mode fix (c) closed for
+  // the marker-splice refusal, in a different branch of the same function.
+  // A scripted rollout must not read this as success either.
+  assert.notEqual(code, 0, "install must exit non-zero when it left core.hooksPath pointing elsewhere, gate not wired");
+  const value = execFileSync("git", ["config", "core.hooksPath"], { cwd: dir, encoding: "utf8", env: isolatedGitEnv(dir) }).trim();
   assert.equal(value, ".myhooks");
 });
 

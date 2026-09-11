@@ -4,10 +4,17 @@ import { writeFileSync, mkdtempSync, existsSync, rmSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { makeRepo, runCli, runGit } from "./helpers/temp-repo.mjs";
+import { makeRepo, runCli, runGit, isolatedGitEnv } from "./helpers/temp-repo.mjs";
 
+// Same class as runGit() below (review Finding 5): this needs stdin piping
+// and stdout capture, which runGit() doesn't do, but it's still a `git`
+// child process that would otherwise inherit whatever GIT_* the caller
+// carries - GIT_DIR included. `hash-object -w` writes a loose object into
+// whichever repo GIT_DIR names, so an inherited one here writes into the
+// wrong repo's object database the same way an unprotected update-index or
+// commit writes into its index or history.
 function gitPlumbing(cwd, args, input) {
-  return execFileSync("git", args, { cwd, input, encoding: "utf8" }).trim();
+  return execFileSync("git", args, { cwd, input, encoding: "utf8", env: isolatedGitEnv(cwd) }).trim();
 }
 
 // A synthetic value shaped like a live Stripe secret key (the stripe-key
@@ -153,11 +160,11 @@ test("scan with a nonexistent explicit path exits 2, not 0", () => {
 test("a staged type-change (symlink -> regular file) is scanned, not dropped by the diff filter", () => {
   const dir = makeRepo({});
   const symlinkBlob = gitPlumbing(dir, ["hash-object", "-w", "--stdin"], "somewhere");
-  execFileSync("git", ["update-index", "--add", "--cacheinfo", `120000,${symlinkBlob},cfg`], { cwd: dir });
-  execFileSync("git", ["commit", "-qm", "cfg as symlink"], { cwd: dir });
+  runGit(dir, "update-index", "--add", "--cacheinfo", `120000,${symlinkBlob},cfg`);
+  runGit(dir, "commit", "-qm", "cfg as symlink");
 
   const secretBlob = gitPlumbing(dir, ["hash-object", "-w", "--stdin"], "STRIPE_KEY=" + LIVE + "\n");
-  execFileSync("git", ["update-index", "--cacheinfo", `100644,${secretBlob},cfg`], { cwd: dir });
+  runGit(dir, "update-index", "--cacheinfo", `100644,${secretBlob},cfg`);
 
   // Confirm the fixture actually produces a T status before trusting the
   // scan result either way.
@@ -176,7 +183,7 @@ test("a staged type-change (symlink -> regular file) is scanned, not dropped by 
 test("a staged gitlink (submodule reference) is reported as skipped, not silently dropped", () => {
   const dir = makeRepo({});
   const fakeSha = "a".repeat(40);
-  execFileSync("git", ["update-index", "--add", "--cacheinfo", `160000,${fakeSha},vendor/lib`], { cwd: dir });
+  runGit(dir, "update-index", "--add", "--cacheinfo", `160000,${fakeSha},vendor/lib`);
 
   const { code, stdout } = runCli(dir, ["scan", "--staged"]);
   assert.equal(code, 0, "a gitlink alone is not a credential finding");
@@ -345,12 +352,12 @@ test("--diff-filter=d scans an added file and a type-change but excludes a delet
   const dir = makeRepo({ "keep.md": "clean\n", "gone.md": "nothing secret about this file at all\n" }, { commit: true });
 
   const symlinkBlob = gitPlumbing(dir, ["hash-object", "-w", "--stdin"], "somewhere");
-  execFileSync("git", ["update-index", "--add", "--cacheinfo", `120000,${symlinkBlob},cfg`], { cwd: dir });
-  execFileSync("git", ["commit", "-qm", "cfg as symlink"], { cwd: dir });
+  runGit(dir, "update-index", "--add", "--cacheinfo", `120000,${symlinkBlob},cfg`);
+  runGit(dir, "commit", "-qm", "cfg as symlink");
 
   const secretBlob = gitPlumbing(dir, ["hash-object", "-w", "--stdin"], "STRIPE_KEY=" + LIVE + "\n");
-  execFileSync("git", ["update-index", "--cacheinfo", `100644,${secretBlob},cfg`], { cwd: dir });
-  execFileSync("git", ["rm", "--cached", "-q", "gone.md"], { cwd: dir });
+  runGit(dir, "update-index", "--cacheinfo", `100644,${secretBlob},cfg`);
+  runGit(dir, "rm", "--cached", "-q", "gone.md");
   writeFileSync(path.join(dir, "new.md"), "STRIPE_KEY=" + LIVE + "\n");
   runGit(dir, "add", "new.md");
 

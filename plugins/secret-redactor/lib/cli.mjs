@@ -711,11 +711,13 @@ function install(args) {
   const full = template("pre-commit");
   const block = full.slice(full.indexOf(MARK_START));
   let hookWritten = false;
-  // Set when spliceHook refuses rather than guessing (a malformed marker
-  // pair) - install must not report success on stdout AND exit 0 on that
-  // path. A scripted rollout across nineteen repos reads exit 0 as "the
-  // gate is wired," and the refusal note is loud on stdout but invisible to
-  // a script that only checks the exit code.
+  // True whenever THIS install did not end with the gate actually wired
+  // into git - set here when spliceHook refuses rather than guessing (a
+  // malformed marker pair), and again further down when core.hooksPath
+  // points somewhere other than .githooks. Both notes are loud on stdout,
+  // but a script that only checks the exit code (this plugin's own rollout
+  // across nineteen repos included) reads exit 0 as "the gate is wired" no
+  // matter what stdout says, so either failure has to reach the exit code.
   let refused = false;
   if (existsSync(hookFile)) {
     const spliced = spliceHook(readFileSync(hookFile, "utf8"), block, full);
@@ -800,10 +802,19 @@ function install(args) {
     git(["config", "core.hooksPath", ".githooks"], root);
     notes.push("set core.hooksPath to .githooks");
   } else {
+    // Review Finding 4: this is the same failure mode fix (c) closed for the
+    // marker-splice refusal above, in a different branch of this same
+    // function - core.hooksPath pointing elsewhere means git will never run
+    // .githooks/pre-commit, so the gate is NOT wired, no matter how many of
+    // steps 1-5 above succeeded. The note was already loud on stdout; only
+    // the exit code was silently claiming success. Reusing `refused` rather
+    // than a second flag keeps "did install actually wire the gate up" a
+    // single source of truth for the exit code.
     notes.push(
       `LEFT ALONE: core.hooksPath is ${value}, not .githooks. ` +
         `Wire .githooks/pre-commit into ${value} yourself, or run: git config core.hooksPath .githooks`,
     );
+    refused = true;
   }
 
   process.stdout.write(
